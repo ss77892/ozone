@@ -2337,8 +2337,8 @@
           </environmentVariables>
           <trimStackTrace>false</trimStackTrace>
           <systemPropertyVariables>
-            <hadoop.log.dir>${project.build.directory}/log</hadoop.log.dir>
-            <hadoop.tmp.dir>${project.build.directory}/tmp</hadoop.tmp.dir>
+            <hadoop.log.dir>${project.build.directory}/log${surefire.forkNumber}</hadoop.log.dir>
+            <hadoop.tmp.dir>${project.build.directory}/tmp${surefire.forkNumber}</hadoop.tmp.dir>
             <java.net.preferIPv4Stack>true</java.net.preferIPv4Stack>
             <java.security.egd>${java.security.egd}</java.security.egd>
             <java.security.krb5.conf>${project.build.directory}/test-classes/krb5.conf</java.security.krb5.conf>

@@ -387,19 +387,25 @@ public abstract class GenericTestUtils {
 
     public static final String HOSTNAME = "localhost";
     public static final String HOST_ADDRESS = "127.0.0.1";
-    public static final int MIN_PORT = 15000;
+    public static final int BASE_PORT = 15000;
     public static final int MAX_PORT = 32000;
-    public static final AtomicInteger NEXT_PORT = new AtomicInteger(MIN_PORT);
+    public static final int BLOCK_SIZE = 500;
+    
+    private static final AtomicInteger NEXT_PORT = new AtomicInteger(0);
 
     private PortAllocator() {
       // no instances
     }
 
     public static synchronized int getFreePort() {
-      int port = NEXT_PORT.getAndIncrement();
-      if (port > MAX_PORT) {
-        NEXT_PORT.set(MIN_PORT);
-        port = NEXT_PORT.getAndIncrement();
+      int forkId = Integer.getInteger("develocity.listener.surefire.forkId", 1) - 1;
+      int basePortForFork = BASE_PORT + forkId * BLOCK_SIZE;
+      int maxPortForFork = Math.min(basePortForFork + BLOCK_SIZE, MAX_PORT);
+      
+      int port = basePortForFork + NEXT_PORT.getAndIncrement();
+      if (port >= maxPortForFork) {
+        NEXT_PORT.set(0);
+        port = basePortForFork + NEXT_PORT.getAndIncrement();
       }
       return port;
     }
