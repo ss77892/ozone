@@ -25,6 +25,7 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.commons.lang3.tuple.Pair;
@@ -38,6 +39,10 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ReadChunkResponseProto;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.hadoop.hdds.scm.storage.StreamingChunkReader;
+import org.apache.hadoop.hdds.scm.storage.StreamingXceiverClient;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi.Validator;
@@ -100,6 +105,13 @@ public class ChunkInputStream extends InputStream
 
   private static final int EOF = -1;
   private final List<Validator> validators;
+  
+  // Streaming support
+  private StreamingChunkReader streamingReader;
+  private boolean streamingEnabled;
+  private int streamingBufferSize;
+
+  private static final Logger LOG = LoggerFactory.getLogger(ChunkInputStream.class);
 
   ChunkInputStream(ChunkInfo chunkInfo, BlockID blockId,
       XceiverClientFactory xceiverClientFactory,
@@ -114,6 +126,11 @@ public class ChunkInputStream extends InputStream
     this.verifyChecksum = verifyChecksum;
     this.tokenSupplier = tokenSupplier;
     validators = ContainerProtocolCalls.toValidatorList(this::validateChunk);
+    
+    // Initialize streaming support - will be enabled when client supports it
+    this.streamingEnabled = false;
+    this.streamingReader = null;
+    this.streamingBufferSize = 1024 * 1024; // Default 1MB buffer size
   }
 
   public synchronized long getRemaining() {
@@ -282,6 +299,12 @@ public class ChunkInputStream extends InputStream
   public synchronized void close() {
     releaseBuffers();
     releaseClient();
+    
+    // Clean up streaming resources
+    if (streamingReader != null) {
+      streamingReader.close();
+      streamingReader = null;
+    }
   }
 
   protected synchronized void releaseClient() {
@@ -312,6 +335,12 @@ public class ChunkInputStream extends InputStream
       Pipeline pipeline = pipelineSupplier.get();
       xceiverClient = xceiverClientFactory.acquireClientForReadData(pipeline);
       updateDatanodeBlockId(pipeline);
+      
+      // Check if streaming is supported
+      if (xceiverClient instanceof StreamingXceiverClient) {
+        StreamingXceiverClient streamingClient = (StreamingXceiverClient) xceiverClient;
+        streamingEnabled = streamingClient.isStreamingEnabled();
+      }
     }
   }
 
@@ -436,6 +465,17 @@ public class ChunkInputStream extends InputStream
   protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo)
       throws IOException {
 
+    // Try streaming read first if enabled
+    if (streamingEnabled && xceiverClient instanceof StreamingXceiverClient) {
+      try {
+        return readChunkStreaming(readChunkInfo);
+      } catch (IOException e) {
+        LOG.warn("Streaming read failed, falling back to traditional read: {}", e.getMessage());
+        // Fall through to traditional read
+      }
+    }
+
+    // Traditional read
     ReadChunkResponseProto readChunkResponse =
         ContainerProtocolCalls.readChunk(xceiverClient, readChunkInfo, datanodeBlockID, validators,
             tokenSupplier.get());
@@ -451,6 +491,31 @@ public class ChunkInputStream extends InputStream
       throw new IOException("Unexpected error while reading chunk data " +
           "from container. No data returned.");
     }
+  }
+  
+  /**
+   * Read chunk using streaming gRPC - placeholder implementation.
+   * This will be fully implemented once protocol buffers are regenerated.
+   */
+  private ByteBuffer[] readChunkStreaming(ChunkInfo readChunkInfo) throws IOException {
+    if (streamingReader == null) {
+      streamingReader = new StreamingChunkReader(xceiverClient, datanodeBlockID, streamingBufferSize);
+    }
+    
+    LOG.debug("Using streaming read for chunk {}", readChunkInfo.getChunkName());
+    
+    // Start streaming for this single chunk
+    List<ChunkInfo> chunks = Collections.singletonList(readChunkInfo);
+    streamingReader.startStreaming(chunks);
+    
+    // Get the streamed data
+    ByteBuffer buffer = streamingReader.readNext();
+    if (buffer == null) {
+      throw new IOException("Failed to read chunk via streaming: " + readChunkInfo.getChunkName());
+    }
+    
+    // Convert single ByteBuffer to array for compatibility
+    return new ByteBuffer[]{buffer};
   }
 
   private void validateChunk(

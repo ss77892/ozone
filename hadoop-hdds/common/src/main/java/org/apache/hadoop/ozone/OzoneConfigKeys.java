@@ -508,6 +508,15 @@ public final class OzoneConfigKeys {
       "ozone.network.topology.aware.read";
   public static final boolean OZONE_NETWORK_TOPOLOGY_AWARE_READ_DEFAULT = true;
 
+  // gRPC Streaming configuration
+  public static final String OZONE_CLIENT_GRPC_STREAMING_ENABLED_KEY =
+      "ozone.client.grpc.streaming.enabled";
+  public static final boolean OZONE_CLIENT_GRPC_STREAMING_ENABLED_DEFAULT = true;
+  
+  public static final String OZONE_CLIENT_GRPC_STREAMING_BUFFER_SIZE_KEY =
+      "ozone.client.grpc.streaming.buffer.size";
+  public static final int OZONE_CLIENT_GRPC_STREAMING_BUFFER_SIZE_DEFAULT = 1024 * 1024; // 1MB
+
   public static final String OZONE_MANAGER_FAIR_LOCK = "ozone.om.lock.fair";
   public static final boolean OZONE_MANAGER_FAIR_LOCK_DEFAULT = false;
 

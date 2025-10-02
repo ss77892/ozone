@@ -134,4 +134,93 @@ public class GrpcXceiverService extends
       }
     };
   }
+  
+  // Streaming read implementation
+  @Override
+  public void streamRead(org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadRequest request, 
+                        org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver<org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse> responseObserver) {
+    LOG.info("Streaming read request received for {} chunks in block {}", 
+             request.getChunksCount(), request.getBlockID().getLocalID());
+    
+    try {
+      for (org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo chunkInfo : request.getChunksList()) {
+        // Create individual read chunk request for each chunk
+        org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto readRequest = 
+            org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto.newBuilder()
+                .setCmdType(org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Type.ReadChunk)
+                .setContainerID(request.getBlockID().getContainerID())
+                .setDatanodeUuid("")
+                .setReadChunk(org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ReadChunkRequestProto.newBuilder()
+                    .setBlockID(request.getBlockID())
+                    .setChunkData(chunkInfo)
+                    .setReadChunkVersion(request.getReadChunkVersion())
+                    .build())
+                .build();
+        
+        // Dispatch the read request
+        DispatcherContext context = DispatcherContext.newBuilder(
+            DispatcherContext.Op.HANDLE_READ_CHUNK)
+            .setReleaseSupported(true)
+            .build();
+        
+        try {
+          org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto response = dispatcher.dispatch(readRequest, context);
+          
+          if (response.getResult() == org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.SUCCESS) {
+            org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ReadChunkResponseProto readResponse = response.getReadChunk();
+            
+            // Create streaming response
+            org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse.Builder streamResponse = org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse.newBuilder()
+                .setBlockID(request.getBlockID())
+                .setChunkData(chunkInfo)
+                .setOffset(chunkInfo.getOffset())
+                .setLength((int) chunkInfo.getLen());
+            
+            // Add data from response
+            if (readResponse.hasData()) {
+              streamResponse.setData(readResponse.getData());
+            } else if (readResponse.hasDataBuffers()) {
+              // Concatenate multiple buffers into single ByteString
+              org.apache.ratis.thirdparty.com.google.protobuf.ByteString.Output output = org.apache.ratis.thirdparty.com.google.protobuf.ByteString.newOutput();
+              for (org.apache.ratis.thirdparty.com.google.protobuf.ByteString buffer : readResponse.getDataBuffers().getBuffersList()) {
+                buffer.writeTo(output);
+              }
+              streamResponse.setData(output.toByteString());
+            }
+            
+            responseObserver.onNext(streamResponse.build());
+            
+          } else {
+            org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse errorResponse = org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse.newBuilder()
+                .setBlockID(request.getBlockID())
+                .setChunkData(chunkInfo)
+                .setError("Failed to read chunk: " + response.getMessage())
+                .build();
+            responseObserver.onNext(errorResponse);
+          }
+          
+        } catch (Exception e) {
+          LOG.error("Error reading chunk {} from block {}", 
+                   chunkInfo.getChunkName(), request.getBlockID().getLocalID(), e);
+          org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse errorResponse = org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse.newBuilder()
+              .setBlockID(request.getBlockID())
+              .setChunkData(chunkInfo)
+              .setError("Exception reading chunk: " + e.getMessage())
+              .build();
+          responseObserver.onNext(errorResponse);
+        } finally {
+          if (context != null) {
+            context.release();
+          }
+        }
+      }
+      
+      responseObserver.onCompleted();
+      LOG.info("Streaming read completed for block {}", request.getBlockID().getLocalID());
+      
+    } catch (Exception e) {
+      LOG.error("Streaming read failed for block {}", request.getBlockID().getLocalID(), e);
+      responseObserver.onError(e);
+    }
+  }
 }

@@ -41,6 +41,8 @@ import org.apache.hadoop.hdds.conf.ConfigurationSource;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.DatanodeID;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadRequest;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.StreamReadResponse;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.DatanodeBlockID;
@@ -48,6 +50,7 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.XceiverClientProtocolServi
 import org.apache.hadoop.hdds.protocol.datanode.proto.XceiverClientProtocolServiceGrpc.XceiverClientProtocolServiceStub;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState;
+import org.apache.hadoop.hdds.scm.storage.StreamingXceiverClient;
 import org.apache.hadoop.hdds.scm.client.ClientTrustManager;
 import org.apache.hadoop.hdds.scm.client.HddsClientUtils;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
@@ -81,7 +84,8 @@ import org.slf4j.LoggerFactory;
  * the README.gRPC.md file in the package of this class for broader context on
  * how it works, and how it is integrated with the Ozone client.
  */
-public class XceiverClientGrpc extends XceiverClientSpi {
+public class XceiverClientGrpc extends XceiverClientSpi 
+    implements StreamingXceiverClient {
   private static final Logger LOG =
       LoggerFactory.getLogger(XceiverClientGrpc.class);
   private final Pipeline pipeline;
@@ -97,6 +101,13 @@ public class XceiverClientGrpc extends XceiverClientSpi {
   // Cache the DN which returned the GetBlock command so that the ReadChunk
   // command can be sent to the same DN.
   private final Map<DatanodeBlockID, DatanodeDetails> getBlockDNcache;
+
+  // Streaming configuration
+  private final boolean streamingEnabled;
+  private final int streamingBufferSize;
+  
+  // Default streaming buffer size (1MB)
+  private static final int DEFAULT_STREAMING_BUFFER_SIZE = 1024 * 1024;
 
   private boolean closed = false;
 
@@ -129,6 +140,14 @@ public class XceiverClientGrpc extends XceiverClientSpi {
         OzoneConfigKeys.OZONE_NETWORK_TOPOLOGY_AWARE_READ_DEFAULT);
     this.trustManager = trustManager;
     this.getBlockDNcache = new ConcurrentHashMap<>();
+    
+    // Initialize streaming configuration
+    this.streamingEnabled = config.getBoolean(
+        OzoneConfigKeys.OZONE_CLIENT_GRPC_STREAMING_ENABLED_KEY, 
+        OzoneConfigKeys.OZONE_CLIENT_GRPC_STREAMING_ENABLED_DEFAULT);
+    this.streamingBufferSize = config.getInt(
+        OzoneConfigKeys.OZONE_CLIENT_GRPC_STREAMING_BUFFER_SIZE_KEY, 
+        OzoneConfigKeys.OZONE_CLIENT_GRPC_STREAMING_BUFFER_SIZE_DEFAULT);
   }
 
   /**
@@ -669,5 +688,49 @@ public class XceiverClientGrpc extends XceiverClientSpi {
 
   public void setTimeout(long timeout) {
     this.timeout = timeout;
+  }
+
+  // StreamingXceiverClient interface implementation
+  
+  @Override
+  public void streamRead(StreamReadRequest request, 
+                        StreamObserver<StreamReadResponse> responseObserver) 
+                        throws IOException {
+    if (!streamingEnabled) {
+      throw new IOException("Streaming reads are not enabled");
+    }
+    
+    DatanodeDetails dn = topologyAwareRead ? 
+        pipeline.getClosestNode() : pipeline.getFirstNode();
+    
+    XceiverClientProtocolServiceStub stub = asyncStubs.get(dn.getID());
+    if (stub == null) {
+      connectToDatanode(dn);
+      stub = asyncStubs.get(dn.getID());
+    }
+    
+    if (stub == null) {
+      throw new IOException("Failed to get gRPC stub for DataNode: " + dn);
+    }
+    
+    LOG.info("Starting streaming read for {} chunks to DataNode {}", 
+             request.getChunksCount(), dn.getHostName());
+    
+    try {
+      stub.streamRead(request, responseObserver);
+    } catch (Exception e) {
+      LOG.error("Failed to start streaming read to DataNode {}", dn, e);
+      throw new IOException("Streaming read failed", e);
+    }
+  }
+  
+  @Override
+  public boolean isStreamingEnabled() {
+    return streamingEnabled;
+  }
+  
+  @Override
+  public int getStreamingBufferSize() {
+    return streamingBufferSize;
   }
 }
