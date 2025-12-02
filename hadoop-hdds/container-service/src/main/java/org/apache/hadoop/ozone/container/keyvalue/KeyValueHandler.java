@@ -2137,7 +2137,7 @@ public class KeyValueHandler extends Handler {
       shouldRead = blockFile.read(buffer);
       buffer.flip();
       final int readLength = buffer.remaining();
-      assertTrue(readLength > 0, () -> "readLength = " + readLength + " <= 0");
+      assertTrue(readLength > 0, () -> "readLength = " + readLength + " < 0");
       if (checksumType != ContainerProtos.ChecksumType.NONE) {
         final List<ByteString> checksums = getChecksums(adjustedOffset, readLength,
             bytesPerChunk, bytesPerChecksum, chunkInfos);
