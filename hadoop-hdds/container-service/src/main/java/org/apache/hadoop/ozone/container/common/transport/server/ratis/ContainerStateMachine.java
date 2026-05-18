@@ -456,11 +456,15 @@ public class ContainerStateMachine extends BaseStateMachine {
 
     final ContainerCommandRequestProto requestProto;
     if (logProto.getCmdType() == Type.WriteChunk) {
-      // combine state machine data
-      requestProto = ContainerCommandRequestProto.newBuilder(logProto)
-          .setWriteChunk(WriteChunkRequestProto.newBuilder(logProto.getWriteChunk())
-          .setData(stateMachineLogEntry.getStateMachineEntry().getStateMachineData()))
-          .build();
+      // stateMachineData carries a complete ContainerCommandRequestProto (with chunk data),
+      // so followers can parse it directly — no manual field reconstruction needed.
+      try {
+        requestProto = ContainerCommandRequestProto.parseFrom(
+            stateMachineLogEntry.getStateMachineEntry().getStateMachineData());
+      } catch (InvalidProtocolBufferException e) {
+        trx.setException(e);
+        return trx;
+      }
     } else {
       // request and log are the same when there is no state machine data,
       requestProto = logProto;
@@ -500,6 +504,8 @@ public class ContainerStateMachine extends BaseStateMachine {
     final ContainerCommandRequestProto.Builder protoBuilder = ContainerCommandRequestProto.newBuilder(proto)
         .clearEncodedToken();
     boolean blockAlreadyFinalized = false;
+    // For WriteChunk, holds the full proto (with data) that travels in stateMachineData.
+    ContainerCommandRequestProto fullProtoWithData = null;
     if (proto.getCmdType() == Type.PutBlock) {
       blockAlreadyFinalized = shouldRejectRequest(proto.getPutBlock().getBlockData().getBlockID());
     } else if (proto.getCmdType() == Type.WriteChunk) {
@@ -508,13 +514,15 @@ public class ContainerStateMachine extends BaseStateMachine {
       if (!blockAlreadyFinalized) {
         Preconditions.checkArgument(write.hasData());
         Preconditions.checkArgument(!write.getData().isEmpty());
-        final WriteChunkRequestProto.Builder commitWriteChunkProto = WriteChunkRequestProto.newBuilder(write)
-            .clearData();
-        protoBuilder.setWriteChunk(commitWriteChunkProto)
-            .setPipelineID(getGroupId().getUuid().toString())
+        // Set metadata fields while the write chunk still contains data, then snapshot.
+        protoBuilder.setPipelineID(getGroupId().getUuid().toString())
             .setTraceID(proto.getTraceID());
-
-        builder.setStateMachineData(write.getData());
+        // fullProtoWithData: token cleared, pipelineID set, chunk data present — travels in AppendEntries.
+        fullProtoWithData = protoBuilder.build();
+        // Strip data for the WAL entry (logProto).
+        protoBuilder.setWriteChunk(WriteChunkRequestProto.newBuilder(write).clearData());
+        // stateMachineData carries the full proto so followers can parse it directly.
+        builder.setStateMachineData(fullProtoWithData.toByteString());
       }
     } else if (proto.getCmdType() == Type.FinalizeBlock) {
       containerController.addFinalizedBlock(proto.getContainerID(),
@@ -528,7 +536,12 @@ public class ContainerStateMachine extends BaseStateMachine {
       return transactionContext;
     } else {
       final ContainerCommandRequestProto containerCommandRequestProto = protoBuilder.build();
-      TransactionContext txnContext = builder.setStateMachineContext(new Context(proto, containerCommandRequestProto))
+      // For WriteChunk use fullProtoWithData (data present) so write() can dispatch WRITE_DATA.
+      // For all other commands requestProto == logProto (no state machine data).
+      final ContainerCommandRequestProto requestProtoForContext =
+          fullProtoWithData != null ? fullProtoWithData : proto;
+      TransactionContext txnContext = builder
+          .setStateMachineContext(new Context(requestProtoForContext, containerCommandRequestProto))
           .setLogData(containerCommandRequestProto.toByteString())
           .build();
       metrics.recordStartTransactionCompleteNs(Time.monotonicNowNanos() - startTime);
@@ -589,7 +602,9 @@ public class ContainerStateMachine extends BaseStateMachine {
     Preconditions.checkArgument(!write.getData().isEmpty());
     try {
       if (server.getDivision(getGroupId()).getInfo().isLeader()) {
-        stateMachineDataCache.put(entryIndex, write.getData());
+        // Cache the full proto bytes so read() can return them for slow followers
+        // without having to reconstruct the proto from raw bytes.
+        stateMachineDataCache.put(entryIndex, requestProto.toByteString());
       }
     } catch (InterruptedException ioe) {
       Thread.currentThread().interrupt();
@@ -881,7 +896,13 @@ public class ContainerStateMachine extends BaseStateMachine {
         "read chunk len=%s does not match chunk expected len=%s for chunk:%s",
         data.size(), chunkInfo.getLen(), chunkInfo);
 
-    return data;
+    // Return the full proto bytes (not raw chunk bytes) so that followers can
+    // parse stateMachineData directly via parseFrom() without reconstruction.
+    final ContainerCommandRequestProto fullProto = ContainerCommandRequestProto.newBuilder(requestProto)
+        .setWriteChunk(WriteChunkRequestProto.newBuilder(requestProto.getWriteChunk())
+            .setData(data))
+        .build();
+    return fullProto.toByteString();
   }
 
   /**
