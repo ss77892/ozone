@@ -44,6 +44,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -455,9 +456,10 @@ public class ContainerStateMachine extends BaseStateMachine {
     }
 
     final ContainerCommandRequestProto requestProto;
-    if (logProto.getCmdType() == Type.WriteChunk) {
-      // stateMachineData carries a complete ContainerCommandRequestProto (with chunk data),
-      // so followers can parse it directly — no manual field reconstruction needed.
+    if (logProto.getCmdType() == Type.WriteChunk || logProto.getCmdType() == Type.PutBlock) {
+      // stateMachineData carries a complete ContainerCommandRequestProto;
+      // parse it directly — no manual reconstruction needed.
+      // For WriteChunk it includes chunk data; for PutBlock it is the same as logData.
       try {
         requestProto = ContainerCommandRequestProto.parseFrom(
             stateMachineLogEntry.getStateMachineEntry().getStateMachineData());
@@ -536,10 +538,15 @@ public class ContainerStateMachine extends BaseStateMachine {
       return transactionContext;
     } else {
       final ContainerCommandRequestProto containerCommandRequestProto = protoBuilder.build();
-      // For WriteChunk use fullProtoWithData (data present) so write() can dispatch WRITE_DATA.
-      // For all other commands requestProto == logProto (no state machine data).
+      // For WriteChunk: fullProtoWithData carries chunk data so write() can dispatch WRITE_DATA.
+      // For PutBlock: carry the proto as stateMachineData so Ratis calls write() on all nodes,
+      //   enabling the RocksDB write to happen pre-quorum on every node (no metadata gap on follower crash).
+      // For all other commands: no state machine data.
       final ContainerCommandRequestProto requestProtoForContext =
           fullProtoWithData != null ? fullProtoWithData : proto;
+      if (proto.getCmdType() == Type.PutBlock && !blockAlreadyFinalized) {
+        builder.setStateMachineData(containerCommandRequestProto.toByteString());
+      }
       TransactionContext txnContext = builder
           .setStateMachineContext(new Context(requestProtoForContext, containerCommandRequestProto))
           .setLogData(containerCommandRequestProto.toByteString())
@@ -700,6 +707,115 @@ public class ContainerStateMachine extends BaseStateMachine {
     }
   }
 
+  /**
+   * Writes PutBlock metadata to RocksDB inside {@link StateMachine.DataApi#write()}, before Raft quorum.
+   * This ensures every node that ACKs the log entry has already persisted the block metadata,
+   * eliminating the gap where a follower crashes after the leader commits but before the follower
+   * runs {@link #applyTransaction(TransactionContext)}.
+   *
+   * <p>Ordering: waits for all preceding WriteChunk {@code raftFuture}s to complete before
+   * dispatching so that {@code finishWriteChunks()} inside {@link KeyValueHandler#handlePutBlock}
+   * always sees fully written chunk files.
+   *
+   * <p>{@link #applyTransaction(TransactionContext)} becomes a no-op for PutBlock because
+   * {@code persistPutBlock()} detects the already-written BCSID and returns early.
+   */
+  private CompletableFuture<Message> writePutBlockData(
+      ContainerCommandRequestProto requestProto, long entryIndex, long term,
+      long startTime) {
+    final WriteFutures previous = writeChunkFutureMap.get(entryIndex);
+    if (previous != null) {
+      return previous.getRaftFuture();
+    }
+    try {
+      if (ratisServer.getServer().getDivision(getGroupId()).getInfo().isLeader()) {
+        stateMachineDataCache.put(entryIndex, requestProto.toByteString());
+      }
+    } catch (InterruptedException ioe) {
+      Thread.currentThread().interrupt();
+      return completeExceptionally(ioe);
+    } catch (IOException ioe) {
+      return completeExceptionally(ioe);
+    }
+
+    // Snapshot preceding WriteChunk futures so finishWriteChunks() only runs after chunk bytes are on disk.
+    final SortedMap<Long, WriteFutures> preceding = writeChunkFutureMap.headMap(entryIndex, false);
+    final CompletableFuture<Void> precedingChunksDone = preceding.isEmpty()
+        ? CompletableFuture.completedFuture(null)
+        : CompletableFuture.allOf(preceding.values().stream()
+            .map(WriteFutures::getRaftFuture)
+            .toArray(CompletableFuture[]::new));
+
+    final DispatcherContext context = DispatcherContext
+        .newBuilder(DispatcherContext.Op.WRITE_STATE_MACHINE_DATA)
+        .setTerm(term)
+        .setLogIndex(entryIndex)
+        .setContainer2BCSIDMap(container2BCSIDMap)
+        .build();
+
+    final CompletableFuture<Message> raftFuture = new CompletableFuture<>();
+
+    final CompletableFuture<ContainerCommandResponseProto> future = containerTaskQueues.submit(
+        requestProto.getContainerID(),
+        () -> {
+          // Single try-finally ensures writeChunkFutureMap is always cleaned up and
+          // raftFuture is always completed regardless of which code path exits.
+          try {
+            try {
+              precedingChunksDone.get();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              StorageContainerException sce = new StorageContainerException(
+                  "Interrupted waiting for preceding chunk writes at logIndex " + entryIndex,
+                  ContainerProtos.Result.CONTAINER_INTERNAL_ERROR);
+              raftFuture.completeExceptionally(sce);
+              throw sce;
+            } catch (ExecutionException e) {
+              // A preceding write (possibly for a different container) failed; the pipeline
+              // is already closing. Fail this entry so Ratis does not hang waiting for the ACK.
+              StorageContainerException sce = new StorageContainerException(
+                  "Preceding write failed at logIndex " + entryIndex + ": " + e.getMessage(),
+                  ContainerProtos.Result.CONTAINER_INTERNAL_ERROR);
+              raftFuture.completeExceptionally(sce);
+              throw sce;
+            }
+            ContainerCommandResponseProto result = dispatchCommand(requestProto, context);
+            if (result.getResult() != ContainerProtos.Result.SUCCESS
+                && result.getResult() != ContainerProtos.Result.CONTAINER_NOT_OPEN
+                && result.getResult() != ContainerProtos.Result.CLOSED_CONTAINER_IO) {
+              StorageContainerException sce =
+                  new StorageContainerException(result.getMessage(), result.getResult());
+              LOG.error("{}: writePutBlockData failed at logIndex {} containerID={}: {} {}",
+                  getGroupId(), entryIndex, requestProto.getContainerID(),
+                  result.getMessage(), result.getResult());
+              stateMachineHealthy.set(false);
+              raftFuture.completeExceptionally(sce);
+            } else {
+              raftFuture.complete(result::toByteString);
+            }
+            return result;
+          } catch (Exception e) {
+            if (!raftFuture.isDone()) {
+              LOG.error("{}: writePutBlockData failed at logIndex {} containerID={}",
+                  getGroupId(), entryIndex, requestProto.getContainerID(), e);
+              stateMachineHealthy.set(false);
+              raftFuture.completeExceptionally(e);
+            }
+            throw e;
+          } finally {
+            writeChunkFutureMap.remove(entryIndex);
+          }
+        },
+        executor);
+
+    writeChunkFutureMap.put(entryIndex, new WriteFutures(future, raftFuture, startTime));
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("{}: writePutBlockData logIndex={} containerID={}",
+          getGroupId(), entryIndex, requestProto.getContainerID());
+    }
+    return raftFuture;
+  }
+
   private void validateLongRunningWrite() throws StorageContainerException {
     // get min valid write chunk operation's future context
     Map.Entry<Long, WriteFutures> writeFutureContextEntry = null;
@@ -817,6 +933,9 @@ public class ContainerStateMachine extends BaseStateMachine {
       switch (cmdType) {
       case WriteChunk:
         return writeStateMachineData(requestProto, entry.getIndex(),
+            entry.getTerm(), writeStateMachineStartTime);
+      case PutBlock:
+        return writePutBlockData(requestProto, entry.getIndex(),
             entry.getTerm(), writeStateMachineStartTime);
       default:
         throw new IllegalStateException("Cmd Type:" + cmdType
@@ -960,6 +1079,10 @@ public class ContainerStateMachine extends BaseStateMachine {
       final ContainerCommandRequestProto requestProto = context != null ? context.getLogProto()
           : getContainerCommandRequestProto(getGroupId(), entry.getStateMachineLogEntry().getLogData());
 
+      if (requestProto.getCmdType() == Type.PutBlock) {
+        // PutBlock proto is self-contained (no external chunk bytes); return it directly.
+        return CompletableFuture.completedFuture(requestProto.toByteString());
+      }
       if (requestProto.getCmdType() != Type.WriteChunk) {
         throw new IllegalStateException("Cmd type:" + requestProto.getCmdType()
             + " cannot have state machine data");
