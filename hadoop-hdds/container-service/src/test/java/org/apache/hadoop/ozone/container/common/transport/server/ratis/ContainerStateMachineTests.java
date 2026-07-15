@@ -22,6 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -45,15 +47,20 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.hdds.ratis.ContainerCommandRequestMessage;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.ozone.container.common.interfaces.ContainerDispatcher;
+import org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration;
 import org.apache.hadoop.ozone.container.ozoneimpl.ContainerController;
 import org.apache.ozone.test.tag.Flaky;
 import org.apache.ratis.proto.RaftProtos;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.DivisionInfo;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.statemachine.TransactionContext;
@@ -65,6 +72,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Test class to ContainerStateMachine class.
@@ -72,6 +80,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 abstract class ContainerStateMachineTests {
   private ContainerDispatcher dispatcher;
+  private ContainerController controller;
+  private XceiverServerRatis ratisServer;
+  private RaftServer raftServer;
   private final OzoneConfiguration conf = new OzoneConfiguration();
   private ContainerStateMachine stateMachine;
   private final List<ThreadPoolExecutor> executor = IntStream.range(0, 2).mapToObj(i -> new ThreadPoolExecutor(1, 1,
@@ -91,9 +102,9 @@ abstract class ContainerStateMachineTests {
     conf.setTimeDuration(HDDS_CONTAINER_RATIS_STATEMACHINE_WRITE_WAIT_INTERVAL,
         1000_000_000, TimeUnit.NANOSECONDS);
     dispatcher = mock(ContainerDispatcher.class);
-    ContainerController controller = mock(ContainerController.class);
-    XceiverServerRatis ratisServer = mock(XceiverServerRatis.class);
-    RaftServer raftServer = mock(RaftServer.class);
+    controller = mock(ContainerController.class);
+    ratisServer = mock(XceiverServerRatis.class);
+    raftServer = mock(RaftServer.class);
     RaftServer.Division division = mock(RaftServer.Division.class);
     RaftGroup raftGroup = mock(RaftGroup.class);
     DivisionInfo info = mock(DivisionInfo.class);
@@ -105,13 +116,19 @@ abstract class ContainerStateMachineTests {
     when(division.getInfo()).thenReturn(info);
     when(info.isLeader()).thenReturn(isLeader);
     when(ratisServer.getServerDivision(any())).thenReturn(division);
-    stateMachine = new ContainerStateMachine(null,
-        RaftGroupId.randomId(), dispatcher, controller, executor, ratisServer, conf, "containerOp");
+    stateMachine = newStateMachine(conf);
+  }
+
+  private ContainerStateMachine newStateMachine(OzoneConfiguration config) {
+    RaftGroupId gid = RaftGroupId.randomId();
+    ContainerStateMachine csm = new ContainerStateMachine(null,
+        gid, dispatcher, controller, executor, ratisServer, config, "containerOp");
     try {
-      stateMachine.initialize(raftServer, stateMachine.getGroupId(), null);
+      csm.initialize(raftServer, gid, null);
     } catch (Exception e) {
       // Ingore exception, as need init server to be closed
     }
+    return csm;
   }
 
   @AfterEach
@@ -247,6 +264,156 @@ abstract class ContainerStateMachineTests {
     assertEquals(ContainerProtos.Result.CONTAINER_INTERNAL_ERROR, sce.getResult());
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  public void testPutBlockStartTransactionStateMachineData(boolean allReplicaAppliedAck) throws Exception {
+    assumeTrue(isLeader);
+    OzoneConfiguration config = new OzoneConfiguration(conf);
+    config.setBoolean(DatanodeConfiguration.ALL_REPLICA_APPLIED_ACK, allReplicaAppliedAck);
+    ContainerStateMachine csm = allReplicaAppliedAck ? newStateMachine(config) : stateMachine;
+    try {
+      ContainerProtos.ContainerCommandRequestProto putBlock = newPutBlockRequest(1, 1);
+      RaftClientRequest request = RaftClientRequest.newBuilder()
+          .setClientId(ClientId.randomId())
+          .setServerId(RaftPeerId.valueOf("s0"))
+          .setGroupId(csm.getGroupId())
+          .setCallId(1)
+          .setType(RaftClientRequest.writeRequestType())
+          .setMessage(ContainerCommandRequestMessage.toMessage(putBlock, null))
+          .build();
+      TransactionContext trx = csm.startTransaction(request);
+      assertNull(trx.getException());
+      RaftProtos.StateMachineLogEntryProto logEntry = trx.getStateMachineLogEntry();
+      ByteString stateMachineData = logEntry.getStateMachineEntry().getStateMachineData();
+      if (allReplicaAppliedAck) {
+        assertEquals(putBlock.getPutBlock().getBlockData().toByteString(), stateMachineData);
+      } else {
+        assertTrue(stateMachineData.isEmpty());
+      }
+      ContainerProtos.ContainerCommandRequestProto logProto =
+          ContainerProtos.ContainerCommandRequestProto.parseFrom(logEntry.getLogData());
+      assertEquals(ContainerProtos.Type.PutBlock, logProto.getCmdType());
+      assertEquals(putBlock.getPutBlock(), logProto.getPutBlock());
+      assertEquals(putBlock.getContainerID(), logProto.getContainerID());
+    } finally {
+      if (csm != stateMachine) {
+        csm.close();
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {1, 2})
+  public void testPutBlockWriteStateMachineData(int localId) throws Exception {
+    RaftProtos.LogEntryProto entry = mock(RaftProtos.LogEntryProto.class);
+    when(entry.getTerm()).thenReturn(1L);
+    when(entry.getIndex()).thenReturn(7L);
+    TransactionContext trx = mock(TransactionContext.class);
+    ContainerStateMachine.Context context = mock(ContainerStateMachine.Context.class);
+    when(trx.getStateMachineContext()).thenReturn(context);
+    setUpMockPutBlockRequestProtoReturn(context, 1, localId);
+
+    AtomicReference<String> threadName = new AtomicReference<>();
+    doAnswer(e -> {
+      threadName.set(Thread.currentThread().getName());
+      return ContainerProtos.ContainerCommandResponseProto.newBuilder().setCmdType(ContainerProtos.Type.PutBlock)
+          .setResult(ContainerProtos.Result.SUCCESS).build();
+    }).when(dispatcher).dispatch(any(), any());
+
+    Message reply = stateMachine.write(entry, trx).get();
+    assertEquals(ContainerProtos.Result.SUCCESS,
+        ContainerProtos.ContainerCommandResponseProto.parseFrom(reply.getContent()).getResult());
+    ArgumentCaptor<DispatcherContext> captor = ArgumentCaptor.forClass(DispatcherContext.class);
+    verify(dispatcher, times(1)).dispatch(any(ContainerProtos.ContainerCommandRequestProto.class), captor.capture());
+    assertEquals(DispatcherContext.Op.WRITE_STATE_MACHINE_DATA, DispatcherContext.op(captor.getValue()));
+    assertEquals(7L, captor.getValue().getLogIndex());
+    assertNotNull(threadName.get());
+    assertTrue(threadName.get().startsWith("ChunkWriter-" + (localId % 2)), threadName.get());
+  }
+
+  @Test
+  public void testPutBlockWriteContainerNotOpen() throws Exception {
+    RaftProtos.LogEntryProto entry = mock(RaftProtos.LogEntryProto.class);
+    when(entry.getTerm()).thenReturn(1L);
+    when(entry.getIndex()).thenReturn(1L);
+    TransactionContext trx = mock(TransactionContext.class);
+    ContainerStateMachine.Context context = mock(ContainerStateMachine.Context.class);
+    when(trx.getStateMachineContext()).thenReturn(context);
+    setUpMockPutBlockRequestProtoReturn(context, 1, 1);
+    when(dispatcher.dispatch(any(), any())).thenReturn(ContainerProtos.ContainerCommandResponseProto
+        .newBuilder().setCmdType(ContainerProtos.Type.PutBlock)
+        .setResult(ContainerProtos.Result.CONTAINER_NOT_OPEN).build());
+
+    Message reply = stateMachine.write(entry, trx).get();
+    assertEquals(ContainerProtos.Result.CONTAINER_NOT_OPEN,
+        ContainerProtos.ContainerCommandResponseProto.parseFrom(reply.getContent()).getResult());
+    verify(dispatcher, times(1)).dispatch(any(ContainerProtos.ContainerCommandRequestProto.class),
+        any(DispatcherContext.class));
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  public void testPutBlockWriteFailure(boolean failWithException) throws Exception {
+    RaftProtos.LogEntryProto entry = mock(RaftProtos.LogEntryProto.class);
+    when(entry.getTerm()).thenReturn(1L);
+    when(entry.getIndex()).thenReturn(1L);
+    RaftProtos.LogEntryProto entryNext = mock(RaftProtos.LogEntryProto.class);
+    when(entryNext.getTerm()).thenReturn(1L);
+    when(entryNext.getIndex()).thenReturn(2L);
+    TransactionContext trx = mock(TransactionContext.class);
+    ContainerStateMachine.Context context = mock(ContainerStateMachine.Context.class);
+    when(trx.getStateMachineContext()).thenReturn(context);
+    if (failWithException) {
+      when(dispatcher.dispatch(any(), any())).thenThrow(new RuntimeException());
+    } else {
+      when(dispatcher.dispatch(any(), any())).thenReturn(ContainerProtos.ContainerCommandResponseProto
+          .newBuilder().setCmdType(ContainerProtos.Type.PutBlock)
+          .setResult(ContainerProtos.Result.CONTAINER_UNHEALTHY).build());
+    }
+    setUpMockPutBlockRequestProtoReturn(context, 1, 1);
+    ThrowableCatcher catcher = new ThrowableCatcher();
+
+    stateMachine.write(entry, trx).exceptionally(catcher.asSetter()).get();
+    verify(dispatcher, times(1)).dispatch(any(ContainerProtos.ContainerCommandRequestProto.class),
+        any(DispatcherContext.class));
+    reset(dispatcher);
+    assertNotNull(catcher.getReceived());
+    if (failWithException) {
+      assertInstanceOf(RuntimeException.class, catcher.getReceived());
+    } else {
+      Throwable th = catcher.getReceived();
+      if (null != th.getCause()) {
+        th = th.getCause();
+      }
+      assertInstanceOf(StorageContainerException.class, th);
+      assertEquals(ContainerProtos.Result.CONTAINER_UNHEALTHY, ((StorageContainerException) th).getResult());
+    }
+
+    // Writing to another container(containerId 2) should also fail, as in testWriteFailure.
+    setUpMockPutBlockRequestProtoReturn(context, 2, 1);
+    stateMachine.write(entryNext, trx).exceptionally(catcher.asSetter()).get();
+    verify(dispatcher, times(0)).dispatch(any(ContainerProtos.ContainerCommandRequestProto.class),
+        any(DispatcherContext.class));
+    assertInstanceOf(StorageContainerException.class, catcher.getReceived().getCause());
+    StorageContainerException sce = (StorageContainerException) catcher.getReceived().getCause();
+    assertEquals(ContainerProtos.Result.CONTAINER_UNHEALTHY, sce.getResult());
+  }
+
+  @Test
+  public void testPutBlockReadStateMachineData() throws Exception {
+    ContainerProtos.ContainerCommandRequestProto putBlock = newPutBlockRequest(1, 1);
+    RaftProtos.LogEntryProto entry = RaftProtos.LogEntryProto.newBuilder()
+        .setTerm(1L)
+        .setIndex(1L)
+        .setStateMachineLogEntry(RaftProtos.StateMachineLogEntryProto.newBuilder()
+            .setLogData(putBlock.toByteString()))
+        .build();
+
+    ByteString data = stateMachine.read(entry, null).get();
+    assertEquals(putBlock.getPutBlock().getBlockData().toByteString(), data);
+    verify(dispatcher, times(0)).dispatch(any(), any());
+  }
+
   private void setUpMockDispatcherReturn(boolean failWithException) {
     if (failWithException) {
       when(dispatcher.dispatch(any(), any())).thenThrow(new RuntimeException());
@@ -268,6 +435,25 @@ abstract class ContainerStateMachineTests {
                         .setLocalID(localId).build()).build())
         .setContainerID(containerId)
         .setDatanodeUuid(UUID.randomUUID().toString()).build());
+  }
+
+  private void setUpMockPutBlockRequestProtoReturn(ContainerStateMachine.Context context,
+                                                   int containerId, int localId) {
+    when(context.getRequestProto()).thenReturn(newPutBlockRequest(containerId, localId));
+  }
+
+  private static ContainerProtos.ContainerCommandRequestProto newPutBlockRequest(int containerId, int localId) {
+    return ContainerProtos.ContainerCommandRequestProto.newBuilder()
+        .setCmdType(ContainerProtos.Type.PutBlock)
+        .setPutBlock(ContainerProtos.PutBlockRequestProto.newBuilder()
+            .setBlockData(ContainerProtos.BlockData.newBuilder()
+                .setBlockID(ContainerProtos.DatanodeBlockID.newBuilder()
+                    .setContainerID(containerId).setLocalID(localId).build())
+                .setSize(CONTAINER_DATA.length())
+                .build())
+            .build())
+        .setContainerID(containerId)
+        .setDatanodeUuid(UUID.randomUUID().toString()).build();
   }
 
   private void assertResults(boolean failWithException, AtomicReference<Throwable> throwable) {

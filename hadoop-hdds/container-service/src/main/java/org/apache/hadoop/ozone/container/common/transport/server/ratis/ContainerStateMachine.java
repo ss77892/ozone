@@ -161,6 +161,7 @@ public class ContainerStateMachine extends BaseStateMachine {
 
   private final Semaphore applyTransactionSemaphore;
   private final boolean waitOnBothFollowers;
+  private final boolean allReplicaAppliedAck;
   private final HddsDatanodeService datanodeService;
   private static Semaphore semaphore = new Semaphore(1);
   private final AtomicBoolean peersValidated;
@@ -302,6 +303,8 @@ public class ContainerStateMachine extends BaseStateMachine {
 
     this.waitOnBothFollowers = conf.getObject(
         DatanodeConfiguration.class).waitOnAllFollowers();
+    this.allReplicaAppliedAck = conf.getObject(
+        DatanodeConfiguration.class).isAllReplicaAppliedAck();
 
     this.writeChunkWaitMaxNs = conf.getTimeDuration(ScmConfigKeys.HDDS_CONTAINER_RATIS_STATEMACHINE_WRITE_WAIT_INTERVAL,
         ScmConfigKeys.HDDS_CONTAINER_RATIS_STATEMACHINE_WRITE_WAIT_INTERVAL_NS_DEFAULT, TimeUnit.NANOSECONDS);
@@ -503,6 +506,12 @@ public class ContainerStateMachine extends BaseStateMachine {
     boolean blockAlreadyFinalized = false;
     if (proto.getCmdType() == Type.PutBlock) {
       blockAlreadyFinalized = shouldRejectRequest(proto.getPutBlock().getBlockData().getBlockID());
+      if (allReplicaAppliedAck && !blockAlreadyFinalized) {
+        // Attach the BlockData as state machine data so that every replica runs the PutBlock write stage
+        // (see writePutBlockStateMachineData) before the entry is acknowledged as written; the log data
+        // stays the complete PutBlock request, so replay and applyTransaction are unchanged.
+        builder.setStateMachineData(proto.getPutBlock().getBlockData().toByteString());
+      }
     } else if (proto.getCmdType() == Type.WriteChunk) {
       final WriteChunkRequestProto write = proto.getWriteChunk();
       blockAlreadyFinalized = shouldRejectRequest(write.getBlockID());
@@ -829,9 +838,106 @@ public class ContainerStateMachine extends BaseStateMachine {
     case WriteChunk:
       return writeStateMachineData(requestProto, entry.getIndex(),
           entry.getTerm(), writeStateMachineStartTime);
+    case PutBlock:
+      // Only reached when the leader attached state machine data to the PutBlock (all-replica applied ack).
+      return writePutBlockStateMachineData(requestProto, entry.getIndex(),
+          entry.getTerm(), writeStateMachineStartTime);
     default:
       throw new IllegalStateException("Cmd Type:" + cmdType
           + " should not have state machine data");
+    }
+  }
+
+  /**
+   * Write stage of a PutBlock that carries state machine data: runs the PutBlock with
+   * {@link DispatcherContext.Op#WRITE_STATE_MACHINE_DATA} on the same single-thread chunk executor as the block's
+   * WriteChunk write stage, so it is ordered after every earlier WriteChunk of the block. The PutBlock is applied
+   * again with {@link DispatcherContext.Op#APPLY_TRANSACTION} after commit, exactly as without state machine data.
+   */
+  private CompletableFuture<Message> writePutBlockStateMachineData(
+      ContainerCommandRequestProto requestProto, long entryIndex, long term,
+      long startTime) {
+    final WriteFutures previous = writeChunkFutureMap.get(entryIndex);
+    if (previous != null) {
+      // generally state machine will wait forever, for precaution, a check is added if retry happens.
+      return previous.getRaftFuture();
+    }
+    try {
+      validateLongRunningWrite();
+    } catch (StorageContainerException e) {
+      return completeExceptionally(e);
+    }
+    final ContainerProtos.DatanodeBlockID blockID = requestProto.getPutBlock().getBlockData().getBlockID();
+    final long containerId = blockID.getContainerID();
+    final DispatcherContext context =
+        DispatcherContext
+            .newBuilder(DispatcherContext.Op.WRITE_STATE_MACHINE_DATA)
+            .setTerm(term)
+            .setLogIndex(entryIndex)
+            .setContainer2BCSIDMap(container2BCSIDMap)
+            .build();
+    CompletableFuture<Message> raftFuture = new CompletableFuture<>();
+    // same executor as getChunkExecutor picks for this block's WriteChunk
+    Future<ContainerCommandResponseProto> future = chunkExecutors.get(
+        (int) (blockID.getLocalID() % chunkExecutors.size())).submit(() -> {
+          try {
+            try {
+              checkContainerHealthy(containerId, true);
+            } catch (StorageContainerException e) {
+              ContainerCommandResponseProto result = ContainerUtils.logAndReturnError(LOG, e, requestProto);
+              handlePutBlockCommandResult(entryIndex, startTime, result, blockID, raftFuture);
+              return result;
+            }
+            metrics.recordWriteStateMachineQueueingLatencyNs(
+                Time.monotonicNowNanos() - startTime);
+            ContainerCommandResponseProto result = dispatchCommand(requestProto, context);
+            handlePutBlockCommandResult(entryIndex, startTime, result, blockID, raftFuture);
+            return result;
+          } catch (Exception e) {
+            LOG.error("{}: putBlock writeStateMachineData failed: blockId{} logIndex {}",
+                getGroupId(), blockID, entryIndex, e);
+            metrics.incNumWriteDataFails();
+            unhealthyContainers.add(containerId);
+            stateMachineHealthy.set(false);
+            raftFuture.completeExceptionally(e);
+            throw e;
+          } finally {
+            // Remove the future once it finishes execution from the
+            writeChunkFutureMap.remove(entryIndex);
+          }
+        });
+
+    writeChunkFutureMap.put(entryIndex, new WriteFutures(future, raftFuture, startTime));
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("{}: putBlock writeStateMachineData : blockId{} logIndex {}", getGroupId(), blockID, entryIndex);
+    }
+    return raftFuture;
+  }
+
+  private void handlePutBlockCommandResult(long entryIndex, long startTime, ContainerCommandResponseProto r,
+                                           ContainerProtos.DatanodeBlockID blockID,
+                                           CompletableFuture<Message> raftFuture) {
+    // Unlike WriteChunk, no tolerance for CHUNK_FILE_INCONSISTENCY or CONTAINER_UNHEALTHY: a failed write-stage
+    // PutBlock must not be acknowledged as written.
+    if (r.getResult() != ContainerProtos.Result.SUCCESS
+        && r.getResult() != ContainerProtos.Result.CONTAINER_NOT_OPEN
+        && r.getResult() != ContainerProtos.Result.CLOSED_CONTAINER_IO) {
+      StorageContainerException sce =
+          new StorageContainerException(r.getMessage(), r.getResult());
+      LOG.error(getGroupId() + ": putBlock writeStateMachineData failed: blockId" + blockID + " logIndex "
+          + entryIndex + " Error message: " + r.getMessage() + " Container Result: " + r.getResult());
+      metrics.incNumWriteDataFails();
+      stateMachineHealthy.set(false);
+      unhealthyContainers.add(blockID.getContainerID());
+      raftFuture.completeExceptionally(sce);
+    } else {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(getGroupId() + ": putBlock writeStateMachineData completed: blockId" + blockID
+            + " logIndex " + entryIndex);
+      }
+      raftFuture.complete(r::toByteString);
+      metrics.recordWriteStateMachineCompletionNs(
+          Time.monotonicNowNanos() - startTime);
     }
   }
 
@@ -972,6 +1078,10 @@ public class ContainerStateMachine extends BaseStateMachine {
       final ContainerCommandRequestProto requestProto = context != null ? context.getLogProto()
           : getContainerCommandRequestProto(getGroupId(), entry.getStateMachineLogEntry().getLogData());
 
+      if (requestProto.getCmdType() == Type.PutBlock) {
+        // PutBlock state machine data is the BlockData, always regenerated from the log proto (never cached).
+        return CompletableFuture.completedFuture(requestProto.getPutBlock().getBlockData().toByteString());
+      }
       if (requestProto.getCmdType() != Type.WriteChunk) {
         throw new IllegalStateException("Cmd type:" + requestProto.getCmdType()
             + " cannot have state machine data");
