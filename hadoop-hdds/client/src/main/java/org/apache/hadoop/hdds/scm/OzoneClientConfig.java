@@ -317,6 +317,21 @@ public class OzoneClientConfig {
           tags = ConfigTag.CLIENT)
   private boolean enablePutblockPiggybacking = false;
 
+  @Config(key = "ozone.client.all.replica.applied.ack",
+      defaultValue = "false",
+      type = ConfigType.BOOLEAN,
+      description = "When enabled, a PutBlock acknowledgement means that every datanode of the Ratis pipeline " +
+          "has applied the block (chunk bytes in the block file, block metadata in the container RocksDB) " +
+          "at the leader's current durability; there is no fallback to a majority acknowledgement. " +
+          "Every datanode in the cluster must run a version with this feature and " +
+          "hdds.datanode.all.replica.applied.ack must be enabled on them. " +
+          "Requires hdds.ratis.client.request.watch.type=ALL_COMMITTED, " +
+          "ozone.client.stream.putblock.piggybacking=false and ozone.client.incremental.chunk.list=false. " +
+          "Covers only the standard RatisBlockOutputStream path (WriteChunk followed by a standalone PutBlock), " +
+          "not the data-stream path selected by ozone.fs.datastream.enabled, EC or standalone writes.",
+      tags = ConfigTag.CLIENT)
+  private boolean allReplicaAppliedAck = false;
+
   @Config(key = "ozone.client.datastream.putblock.on.close.enabled",
       defaultValue = "false",
       type = ConfigType.BOOLEAN,
@@ -408,6 +423,16 @@ public class OzoneClientConfig {
         LOG.debug("Final ozone.client.key.write.concurrency = {}", maxConcurrentWritePerKey);
       }
       // Note: ozone.fs.hsync.enabled is enforced by OzoneFSUtils#canEnableHsync, not here
+    }
+    // All-replica applied acknowledgement needs a standalone PutBlock carrying the full chunk list,
+    // so it is checked against the effective values after the HBase enhancements gating above.
+    if (allReplicaAppliedAck) {
+      Preconditions.checkArgument(!enablePutblockPiggybacking,
+          "ozone.client.all.replica.applied.ack cannot be enabled together with " +
+              "ozone.client.stream.putblock.piggybacking = true");
+      Preconditions.checkArgument(!incrementalChunkList,
+          "ozone.client.all.replica.applied.ack cannot be enabled together with " +
+              "ozone.client.incremental.chunk.list = true");
     }
     // Validate streaming read configurations.
     // Ensure pre-read size is non-negative. If it's invalid, reset to a sane default.
@@ -636,6 +661,14 @@ public class OzoneClientConfig {
 
   public boolean getEnablePutblockPiggybacking() {
     return enablePutblockPiggybacking;
+  }
+
+  public boolean isAllReplicaAppliedAck() {
+    return allReplicaAppliedAck;
+  }
+
+  public void setAllReplicaAppliedAck(boolean allReplicaAppliedAck) {
+    this.allReplicaAppliedAck = allReplicaAppliedAck;
   }
 
   public boolean isDatastreamPipelineMode() {

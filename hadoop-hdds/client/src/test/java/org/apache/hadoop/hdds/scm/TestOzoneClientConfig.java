@@ -20,6 +20,7 @@ package org.apache.hadoop.hdds.scm;
 import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
@@ -107,5 +108,82 @@ class TestOzoneClientConfig {
     OzoneClientConfig subject = conf.getObject(OzoneClientConfig.class);
 
     assertTrue(subject.isDatastreamPutBlockOnCloseEnabled());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckDefault() {
+    OzoneClientConfig subject = new OzoneConfiguration()
+        .getObject(OzoneClientConfig.class);
+    assertFalse(subject.isAllReplicaAppliedAck());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckAlone() {
+    OzoneConfiguration conf = new OzoneConfiguration();
+    conf.setBoolean("ozone.client.all.replica.applied.ack", true);
+
+    OzoneClientConfig subject = conf.getObject(OzoneClientConfig.class);
+
+    assertTrue(subject.isAllReplicaAppliedAck());
+    assertFalse(subject.getEnablePutblockPiggybacking());
+    assertFalse(subject.getIncrementalChunkList());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckRejectsPutblockPiggybacking() {
+    OzoneConfiguration conf = new OzoneConfiguration();
+    conf.setBoolean("ozone.client.hbase.enhancements.allowed", true);
+    conf.setBoolean("ozone.client.stream.putblock.piggybacking", true);
+    conf.setBoolean("ozone.client.all.replica.applied.ack", true);
+
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+        () -> conf.getObject(OzoneClientConfig.class));
+
+    assertTrue(e.getMessage().contains("ozone.client.all.replica.applied.ack"), e.getMessage());
+    assertTrue(e.getMessage().contains("ozone.client.stream.putblock.piggybacking"), e.getMessage());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckRejectsIncrementalChunkList() {
+    OzoneConfiguration conf = new OzoneConfiguration();
+    conf.setBoolean("ozone.client.hbase.enhancements.allowed", true);
+    conf.setBoolean("ozone.client.incremental.chunk.list", true);
+    conf.setBoolean("ozone.client.all.replica.applied.ack", true);
+
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+        () -> conf.getObject(OzoneClientConfig.class));
+
+    assertTrue(e.getMessage().contains("ozone.client.all.replica.applied.ack"), e.getMessage());
+    assertTrue(e.getMessage().contains("ozone.client.incremental.chunk.list"), e.getMessage());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckWithPiggybackingForcedOffByHBaseGating() {
+    // Piggybacking is forced off because HBase enhancements are disallowed,
+    // so the effective value does not conflict with all-replica applied ack.
+    OzoneConfiguration conf = new OzoneConfiguration();
+    conf.setBoolean("ozone.client.hbase.enhancements.allowed", false);
+    conf.setBoolean("ozone.client.stream.putblock.piggybacking", true);
+    conf.setBoolean("ozone.client.all.replica.applied.ack", true);
+
+    OzoneClientConfig subject = conf.getObject(OzoneClientConfig.class);
+
+    assertTrue(subject.isAllReplicaAppliedAck());
+    assertFalse(subject.getEnablePutblockPiggybacking());
+  }
+
+  @Test
+  void testAllReplicaAppliedAckOffKeepsHBaseEnhancements() {
+    OzoneConfiguration conf = new OzoneConfiguration();
+    conf.setBoolean("ozone.client.hbase.enhancements.allowed", true);
+    conf.setBoolean("ozone.client.stream.putblock.piggybacking", true);
+    conf.setBoolean("ozone.client.incremental.chunk.list", true);
+    conf.setBoolean("ozone.client.all.replica.applied.ack", false);
+
+    OzoneClientConfig subject = conf.getObject(OzoneClientConfig.class);
+
+    assertFalse(subject.isAllReplicaAppliedAck());
+    assertTrue(subject.getEnablePutblockPiggybacking());
+    assertTrue(subject.getIncrementalChunkList());
   }
 }
