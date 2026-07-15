@@ -20,6 +20,8 @@ package org.apache.hadoop.hdds.scm.storage;
 import static java.util.concurrent.Executors.newFixedThreadPool;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
@@ -28,6 +30,8 @@ import static org.mockito.Mockito.when;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -44,6 +48,7 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.PutBlockRe
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Type;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationType;
+import org.apache.hadoop.hdds.scm.AllReplicaWatchFailedException;
 import org.apache.hadoop.hdds.scm.ContainerClientMetrics;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
 import org.apache.hadoop.hdds.scm.StreamBufferArgs;
@@ -56,6 +61,8 @@ import org.apache.hadoop.ozone.ClientVersion;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.container.common.helpers.BlockData;
 import org.apache.hadoop.ozone.container.common.helpers.ChunkInfo;
+import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
+import org.apache.ratis.protocol.exceptions.NotReplicatedException;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -90,6 +97,30 @@ class TestBlockOutputStreamCorrectness {
         }
       }
     }
+  }
+
+  /**
+   * A strict all-replica watch (ozone.client.all.replica.applied.ack) that fails must record the lagging datanodes
+   * in {@link BlockOutputStream#getFailedServers()} and fail the flush, so that KeyOutputStream excludes them on retry.
+   */
+  @Test
+  void testFailedAllReplicaWatchRecordsLaggingDatanodes() throws IOException {
+    final BufferPool bufferPool = new BufferPool(4 * 1024 * 1024, 32 / 4);
+    final Pipeline pipeline = MockPipeline.createRatisPipeline();
+    final DatanodeDetails lagging = pipeline.getNodes().get(0);
+    final BlockOutputStream outputStream = createBlockOutputStream(bufferPool, pipeline,
+        new FailingWatchXceiverClientSpi(pipeline, lagging));
+
+    // 16 MB = stream buffer flush size: the last write fills the fourth buffer and triggers PutBlock + watchForCommit
+    final int writeSize = 1024 * 1024;
+    for (int i = 0; i < 16; i++) {
+      outputStream.write(DATA, i * writeSize, writeSize);
+    }
+
+    assertThrows(IOException.class, outputStream::close);
+    // both the intermediate watch and the one issued by close() fail, so the same datanode may be recorded twice
+    assertEquals(Collections.singleton(lagging), new HashSet<>(outputStream.getFailedServers()));
+    assertNotNull(outputStream.getIoException());
   }
 
   /**
@@ -194,12 +225,16 @@ class TestBlockOutputStreamCorrectness {
 
   private BlockOutputStream createBlockOutputStream(BufferPool bufferPool)
       throws IOException {
-
     final Pipeline pipeline = MockPipeline.createRatisPipeline();
+    return createBlockOutputStream(bufferPool, pipeline, new MockXceiverClientSpi(pipeline));
+  }
+
+  private BlockOutputStream createBlockOutputStream(BufferPool bufferPool, Pipeline pipeline,
+      XceiverClientSpi client) throws IOException {
 
     final XceiverClientManager xcm = mock(XceiverClientManager.class);
     when(xcm.acquireClient(any()))
-        .thenReturn(new MockXceiverClientSpi(pipeline));
+        .thenReturn(client);
 
     OzoneClientConfig config = new OzoneClientConfig();
     config.setStreamBufferSize(4 * 1024 * 1024);
@@ -342,6 +377,29 @@ class TestBlockOutputStreamCorrectness {
     public Map<DatanodeDetails, ContainerCommandResponseProto>
         sendCommandOnAllNodes(ContainerCommandRequestProto request) {
       return null;
+    }
+  }
+
+  /**
+   * XCeiverClient whose strict all-replica watch always fails, reporting one lagging datanode.
+   */
+  private static class FailingWatchXceiverClientSpi extends MockXceiverClientSpi {
+
+    private final DatanodeDetails lagging;
+
+    FailingWatchXceiverClientSpi(Pipeline pipeline, DatanodeDetails lagging) {
+      super(pipeline);
+      this.lagging = lagging;
+    }
+
+    @Override
+    public CompletableFuture<XceiverClientReply> watchForCommit(long index) {
+      final NotReplicatedException cause = new NotReplicatedException(1, ReplicationLevel.ALL_COMMITTED, index,
+          Collections.emptyList());
+      final CompletableFuture<XceiverClientReply> future = new CompletableFuture<>();
+      future.completeExceptionally(
+          new AllReplicaWatchFailedException(index, Collections.singletonList(lagging), cause));
+      return future;
     }
   }
 

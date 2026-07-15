@@ -48,12 +48,14 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.BlockData;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.KeyValue;
+import org.apache.hadoop.hdds.scm.AllReplicaWatchFailedException;
 import org.apache.hadoop.hdds.scm.ContainerClientMetrics;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
 import org.apache.hadoop.hdds.scm.StreamBufferArgs;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
 import org.apache.hadoop.hdds.scm.XceiverClientReply;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
+import org.apache.hadoop.hdds.scm.client.HddsClientUtils;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.ozone.common.Checksum;
@@ -538,6 +540,14 @@ public class BlockOutputStream extends OutputStream {
     return sendWatchForCommit(commitIndex)
         .thenAccept(this::checkReply)
         .exceptionally(e -> {
+          final Throwable watchFailure = HddsClientUtils.containsException(e, AllReplicaWatchFailedException.class);
+          if (watchFailure != null) {
+            // strict all-replica watch: record the lagging datanodes so that KeyOutputStream excludes them on retry
+            final List<DatanodeDetails> dnList = ((AllReplicaWatchFailedException) watchFailure).getFailedDatanodes();
+            LOG.warn("Failed to commit BlockId {} on {}. Failed nodes: {}",
+                blockID, xceiverClient.getPipeline(), dnList);
+            failedServers.addAll(dnList);
+          }
           throw new FlushRuntimeException(setIoException(e));
         })
         .whenComplete((r, e) -> {
