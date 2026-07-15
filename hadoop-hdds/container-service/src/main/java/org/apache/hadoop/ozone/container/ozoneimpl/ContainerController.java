@@ -50,13 +50,20 @@ public class ContainerController {
 
   private final ContainerSet containerSet;
   private final Map<ContainerType, Handler> handlers;
+  private final boolean allReplicaAppliedAck;
   private static final Logger LOG =
       LoggerFactory.getLogger(ContainerController.class);
 
   public ContainerController(final ContainerSet containerSet,
       final Map<ContainerType, Handler> handlers) {
+    this(containerSet, handlers, false);
+  }
+
+  public ContainerController(final ContainerSet containerSet,
+      final Map<ContainerType, Handler> handlers, final boolean allReplicaAppliedAck) {
     this.containerSet = containerSet;
     this.handlers = handlers;
+    this.allReplicaAppliedAck = allReplicaAppliedAck;
   }
 
   /**
@@ -179,6 +186,28 @@ public class ContainerController {
   public void closeContainer(final long containerId) throws IOException {
     final Container container = containerSet.getContainer(containerId);
     getHandler(container).closeContainer(container);
+  }
+
+  /**
+   * Closes a container whose Ratis pipeline no longer exists. With
+   * {@code hdds.datanode.all.replica.applied.ack} on, every acknowledged write
+   * was applied on all replicas, so the container BCSID is first advanced to
+   * the block records and the container is CLOSED directly; otherwise it is
+   * QUASI_CLOSED as before and SCM decides the close.
+   *
+   * @param containerId Id of the container to close
+   * @param reason The reason the pipeline is gone, for logging purposes.
+   * @throws IOException in case of exception
+   */
+  public void closeContainerOnPipelineLoss(final long containerId, String reason)
+      throws IOException {
+    if (allReplicaAppliedAck) {
+      final Container container = containerSet.getContainer(containerId);
+      getHandler(container).advanceContainerBcsIdToBlockRecords(container);
+      closeContainer(containerId);
+    } else {
+      quasiCloseContainer(containerId, reason);
+    }
   }
 
   /**

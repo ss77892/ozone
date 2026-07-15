@@ -240,7 +240,8 @@ public class OzoneContainer {
      * XceiverServerRatis is the write channel
      * XceiverServerGrpc is the read channel
      */
-    controller = new ContainerController(containerSet, handlers);
+    controller = new ContainerController(containerSet, handlers,
+        conf.getObject(DatanodeConfiguration.class).isAllReplicaAppliedAck());
 
     writeChannel = XceiverServerRatis.newXceiverServerRatis(hddsDatanodeService,
         datanodeDetails, config, hddsDispatcher, controller, certClient, context);

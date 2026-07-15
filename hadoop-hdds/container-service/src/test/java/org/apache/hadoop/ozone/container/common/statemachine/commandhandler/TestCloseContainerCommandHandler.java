@@ -25,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -53,6 +54,7 @@ import org.apache.hadoop.ozone.container.ozoneimpl.OzoneContainer;
 import org.apache.hadoop.ozone.protocol.commands.CloseContainerCommand;
 import org.apache.ozone.test.GenericTestUtils;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 /**
  * Test cases to verify CloseContainerCommandHandler in datanode.
@@ -77,11 +79,15 @@ public class TestCloseContainerCommandHandler {
 
   public void initLayoutVersion(ContainerLayoutVersion layout)
       throws Exception {
-    this.layoutVersion = layout;
-    init();
+    initLayoutVersion(layout, false);
   }
 
-  private void init() throws Exception {
+  private void initLayoutVersion(ContainerLayoutVersion layout, boolean allReplicaAppliedAck) throws Exception {
+    this.layoutVersion = layout;
+    init(allReplicaAppliedAck);
+  }
+
+  private void init(boolean allReplicaAppliedAck) throws Exception {
     OzoneConfiguration conf = new OzoneConfiguration();
     context = ContainerTestUtils.getMockContext(randomDatanodeDetails(), conf);
     pipelineID = PipelineID.randomId();
@@ -97,7 +103,7 @@ public class TestCloseContainerCommandHandler {
     containerHandler = mock(Handler.class);
     controller = new ContainerController(containerSet,
         singletonMap(ContainerProtos.ContainerType.KeyValueContainer,
-            containerHandler));
+            containerHandler), allReplicaAppliedAck);
 
     writeChannel = mock(XceiverServerSpi.class);
     ozoneContainer = mock(OzoneContainer.class);
@@ -139,6 +145,48 @@ public class TestCloseContainerCommandHandler {
     // Container in CLOSING state is moved to UNHEALTHY if pipeline does not
     // exist. Container should not exist in CLOSING state without a pipeline.
     verify(containerHandler)
+        .quasiCloseContainer(eq(container), any());
+  }
+
+  @ContainerLayoutTestInfo.ContainerTest
+  public void closeContainerWithoutPipelineAllReplicaAppliedAck(ContainerLayoutVersion layout)
+      throws Exception {
+    initLayoutVersion(layout, true);
+    // close a container that's NOT associated with an open pipeline while
+    // hdds.datanode.all.replica.applied.ack is on
+    subject.handle(closeWithUnknownPipeline(), ozoneContainer, context, null);
+    waitTillFinishExecution(subject);
+
+    verify(containerHandler)
+        .markContainerForClose(container);
+    verify(writeChannel, never())
+        .submitRequest(any(), any());
+    // Container in CLOSING state is CLOSED directly, after its BCSID is
+    // advanced to the block records; it is never quasi closed.
+    InOrder inOrder = inOrder(containerHandler);
+    inOrder.verify(containerHandler).advanceContainerBcsIdToBlockRecords(container);
+    inOrder.verify(containerHandler).closeContainer(container);
+    verify(containerHandler, never())
+        .quasiCloseContainer(eq(container), any());
+  }
+
+  @ContainerLayoutTestInfo.ContainerTest
+  public void forceCloseOpenContainerAllReplicaAppliedAck(ContainerLayoutVersion layout)
+      throws Exception {
+    initLayoutVersion(layout, true);
+    // force-close is unchanged by hdds.datanode.all.replica.applied.ack
+    subject.handle(forceCloseWithoutPipeline(), ozoneContainer, context, null);
+    waitTillFinishExecution(subject);
+
+    verify(containerHandler)
+        .markContainerForClose(container);
+    verify(writeChannel, never())
+        .submitRequest(any(), any());
+    verify(containerHandler)
+        .closeContainer(container);
+    verify(containerHandler, never())
+        .advanceContainerBcsIdToBlockRecords(container);
+    verify(containerHandler, never())
         .quasiCloseContainer(eq(container), any());
   }
 

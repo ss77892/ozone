@@ -1426,16 +1426,17 @@ public class ContainerStateMachine extends BaseStateMachine {
   @Override
   public void notifyGroupRemove() {
     ratisServer.notifyGroupRemove(getGroupId());
-    // Make best effort to quasi-close all the containers on group removal.
+    // Make best effort to close all the containers on group removal: quasi-close
+    // by default, direct close when all-replica-applied ack is on.
     // Containers already in terminal state like CLOSED or UNHEALTHY will not
     // be affected.
     for (Long cid : container2BCSIDMap.keySet()) {
       try {
         containerController.markContainerForClose(cid);
-        containerController.quasiCloseContainer(cid,
+        containerController.closeContainerOnPipelineLoss(cid,
             "Ratis group removed. Group id: " + getGroupId());
       } catch (IOException e) {
-        LOG.debug("Failed to quasi-close container {}", cid);
+        LOG.debug("Failed to close container {} on group removal", cid);
       }
     }
   }

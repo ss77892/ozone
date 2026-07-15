@@ -1656,6 +1656,22 @@ public class KeyValueHandler extends Handler {
   }
 
   @Override
+  public void advanceContainerBcsIdToBlockRecords(Container container) throws IOException {
+    KeyValueContainerData containerData = (KeyValueContainerData) container.getContainerData();
+    long maxBlockBcsId = 0;
+    try (DBHandle dbHandle = BlockUtils.getDB(containerData, conf);
+         BlockIterator<BlockData> blockIterator = dbHandle.getStore().
+             getBlockIterator(containerData.getContainerID())) {
+      while (blockIterator.hasNext()) {
+        maxBlockBcsId = Math.max(maxBlockBcsId, blockIterator.nextBlock().getBlockCommitSequenceId());
+      }
+    }
+    if (maxBlockBcsId > containerData.getBlockCommitSequenceId()) {
+      blockManager.updateContainerBcsId(container, maxBlockBcsId);
+    }
+  }
+
+  @Override
   public void closeContainer(Container container)
       throws IOException {
     long containerID = container.getContainerData().getContainerID();

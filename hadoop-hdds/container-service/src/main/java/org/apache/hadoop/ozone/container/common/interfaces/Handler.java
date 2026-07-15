@@ -236,6 +236,16 @@ public abstract class Handler {
       throws IOException;
 
   /**
+   * Advances the container BCSID to the highest BCSID carried by any of its block records, when that is greater
+   * than the current container BCSID. Used before a direct close on pipeline loss so that block records persisted at
+   * the Ratis write stage but not yet applied are covered by the container BCSID. No-op otherwise.
+   *
+   * @param container container whose BCSID is advanced
+   * @throws IOException
+   */
+  public abstract void advanceContainerBcsIdToBlockRecords(Container container) throws IOException;
+
+  /**
    * Deletes the given container.
    *
    * @param container container to be deleted

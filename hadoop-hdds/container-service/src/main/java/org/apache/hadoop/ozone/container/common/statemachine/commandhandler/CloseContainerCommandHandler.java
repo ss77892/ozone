@@ -130,9 +130,9 @@ public class CloseContainerCommandHandler implements CommandHandler {
             // quasi-closed
             controller.closeContainer(containerId);
           } else {
-            controller.quasiCloseContainer(containerId,
+            controller.closeContainerOnPipelineLoss(containerId,
                 "Ratis pipeline does not exist");
-            LOG.info("Marking Container {} quasi closed", containerId);
+            LOG.info("Closed Container {} on pipeline loss, now {}", containerId, container.getContainerState());
           }
           break;
         case QUASI_CLOSED:

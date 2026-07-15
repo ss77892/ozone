@@ -1030,6 +1030,53 @@ public class TestKeyValueHandler {
     }
   }
 
+  /**
+   * advanceContainerBcsIdToBlockRecords moves the container BCSID up to the highest BCSID carried by a block record
+   * (as left behind by write-stage PutBlocks that were never applied), and leaves it alone when no record exceeds it.
+   */
+  @ContainerLayoutTestInfo.ContainerTest
+  public void testAdvanceContainerBcsIdToBlockRecords(ContainerLayoutVersion layoutVersion) throws Exception {
+    conf.set(OZONE_SCM_CONTAINER_LAYOUT_KEY, layoutVersion.name());
+    HandlerWithVolumeSet handlerCtx = createKeyValueHandler(tempDir);
+    KeyValueHandler kvHandler = handlerCtx.getHandler();
+    MutableVolumeSet volumeSet = handlerCtx.getVolumeSet();
+
+    long containerID = ContainerTestHelper.getTestContainerID();
+    KeyValueContainerData containerData = new KeyValueContainerData(containerID, layoutVersion,
+        (long) StorageUnit.GB.toBytes(1), UUID.randomUUID().toString(), DATANODE_UUID);
+    KeyValueContainer container = new KeyValueContainer(containerData, conf);
+    container.create(volumeSet, new RoundRobinVolumeChoosingPolicy(), CLUSTER_ID);
+    handlerCtx.getContainerSet().addContainer(container);
+    assertEquals(0, container.getBlockCommitSequenceId());
+
+    // Two block records with BCSIDs 3 and 9, persisted without advancing the container BCSID.
+    for (long bcsId : new long[] {3, 9}) {
+      BlockID blockID = ContainerTestHelper.getTestBlockID(containerID);
+      blockID.setBlockCommitSequenceId(bcsId);
+      BlockData blockData = new BlockData(blockID);
+      blockData.addChunk(new ChunkInfo("chunk1", 0, 1024).getProtoBufMessage());
+      kvHandler.getBlockManager().putBlock(container, blockData, true, false);
+    }
+    assertEquals(0, container.getBlockCommitSequenceId());
+
+    try (DBHandle db = BlockUtils.getDB(containerData, conf)) {
+      kvHandler.advanceContainerBcsIdToBlockRecords(container);
+      assertEquals(9, container.getBlockCommitSequenceId());
+      assertEquals(9, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+
+      // A second call finds nothing above the container BCSID and leaves it unchanged.
+      kvHandler.advanceContainerBcsIdToBlockRecords(container);
+      assertEquals(9, container.getBlockCommitSequenceId());
+      assertEquals(9, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+
+      // A container already ahead of every block record is left unchanged.
+      kvHandler.getBlockManager().updateContainerBcsId(container, 12);
+      kvHandler.advanceContainerBcsIdToBlockRecords(container);
+      assertEquals(12, container.getBlockCommitSequenceId());
+      assertEquals(12, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+    }
+  }
+
   private static ContainerCommandRequestProto createContainerRequest(
       String datanodeId, long containerID) {
     return ContainerCommandRequestProto.newBuilder()

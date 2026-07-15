@@ -25,8 +25,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -412,6 +415,43 @@ abstract class ContainerStateMachineTests {
     ByteString data = stateMachine.read(entry, null).get();
     assertEquals(putBlock.getPutBlock().getBlockData().toByteString(), data);
     verify(dispatcher, times(0)).dispatch(any(), any());
+  }
+
+  /**
+   * On group removal every container the state machine knows of (container2BCSIDMap) is marked for close and then
+   * handed to the single ContainerController decision method; the state machine never quasi-closes directly.
+   */
+  @Test
+  public void testNotifyGroupRemoveClosesContainersOnPipelineLoss() throws Exception {
+    RaftProtos.LogEntryProto entry = mock(RaftProtos.LogEntryProto.class);
+    when(entry.getTerm()).thenReturn(1L);
+    TransactionContext trx = mock(TransactionContext.class);
+    ContainerStateMachine.Context context = mock(ContainerStateMachine.Context.class);
+    when(trx.getLogEntry()).thenReturn(entry);
+    when(trx.getStateMachineContext()).thenReturn(context);
+    // The dispatcher registers the container in the DispatcherContext's map, as HddsDispatcher does.
+    when(dispatcher.dispatch(any(), any())).thenAnswer(invocation -> {
+      ContainerProtos.ContainerCommandRequestProto request = invocation.getArgument(0);
+      DispatcherContext dispatcherContext = invocation.getArgument(1);
+      dispatcherContext.getContainer2BCSIDMap().put(request.getContainerID(), dispatcherContext.getLogIndex());
+      return ContainerProtos.ContainerCommandResponseProto.newBuilder()
+          .setCmdType(ContainerProtos.Type.WriteChunk).setResult(ContainerProtos.Result.SUCCESS).build();
+    });
+    int[] containerIds = {1, 2};
+    for (int i = 0; i < containerIds.length; i++) {
+      when(entry.getIndex()).thenReturn((long) i + 1);
+      setUpLogProtoReturn(context, containerIds[i], 1);
+      stateMachine.applyTransaction(trx).get();
+    }
+
+    stateMachine.notifyGroupRemove();
+
+    for (int cid : containerIds) {
+      verify(controller).markContainerForClose(cid);
+      verify(controller).closeContainerOnPipelineLoss(eq((long) cid), anyString());
+    }
+    verify(controller, never()).quasiCloseContainer(any(Long.class), anyString());
+    verify(controller, never()).closeContainer(any(Long.class));
   }
 
   private void setUpMockDispatcherReturn(boolean failWithException) {
