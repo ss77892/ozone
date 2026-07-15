@@ -640,6 +640,48 @@ public class TestHddsDispatcher {
   }
 
   /**
+   * A write-stage PutBlock (WRITE_STATE_MACHINE_DATA) must not refresh container2BCSIDMap, even when the
+   * container is on disk but missing from the map (as after a datanode restart); the apply-stage PutBlock
+   * updates the map entry as before.
+   */
+  @Test
+  public void testWriteStagePutBlockLeavesContainer2BCSIDMap() throws IOException {
+    String testDirPath = testDir.getPath();
+    try {
+      UUID scmId = UUID.randomUUID();
+      OzoneConfiguration conf = new OzoneConfiguration();
+      conf.set(HDDS_DATANODE_DIR_KEY, testDirPath);
+      conf.set(OzoneConfigKeys.OZONE_METADATA_DIRS, testDirPath);
+      DatanodeDetails dd = randomDatanodeDetails();
+      HddsDispatcher hddsDispatcher = createDispatcher(dd, scmId, conf);
+      ContainerCommandRequestProto writeChunkRequest = getWriteChunkRequest(dd.getUuidString(), 1L, 1L);
+      ContainerCommandResponseProto response = hddsDispatcher.dispatch(writeChunkRequest, null);
+      assertEquals(ContainerProtos.Result.SUCCESS, response.getResult());
+      ContainerCommandRequestProto putBlockRequest = ContainerTestHelper.getPutBlockRequest(writeChunkRequest);
+
+      // Write stage with a map that does not know the container: no exception, map untouched.
+      DispatcherContext writeStage = newContext(Op.WRITE_STATE_MACHINE_DATA);
+      Map<Long, Long> writeStageMap = writeStage.getContainer2BCSIDMap();
+      assertTrue(writeStageMap.isEmpty());
+      response = hddsDispatcher.dispatch(putBlockRequest, writeStage);
+      assertEquals(ContainerProtos.Result.SUCCESS, response.getResult());
+      assertTrue(writeStageMap.isEmpty());
+      assertEquals(0, hddsDispatcher.getContainer(1L).getBlockCommitSequenceId());
+
+      // Apply stage with the container in the map: the entry follows the container BCSID (log index 1).
+      DispatcherContext applyStage = newContext(Op.APPLY_TRANSACTION);
+      Map<Long, Long> applyStageMap = applyStage.getContainer2BCSIDMap();
+      applyStageMap.put(1L, 0L);
+      response = hddsDispatcher.dispatch(putBlockRequest, applyStage);
+      assertEquals(ContainerProtos.Result.SUCCESS, response.getResult());
+      assertEquals(1, hddsDispatcher.getContainer(1L).getBlockCommitSequenceId());
+      assertEquals(1, applyStageMap.get(1L));
+    } finally {
+      ContainerMetrics.remove();
+    }
+  }
+
+  /**
    * Creates HddsDispatcher instance with given infos.
    * @param dd datanode detail info.
    * @param scmId UUID of scm id.

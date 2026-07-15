@@ -688,6 +688,8 @@ public class KeyValueHandler extends Handler {
         //     to close the block, in which case we need to flush/close the file.
         if (!request.getPutBlock().getBlockData().getChunksList().isEmpty() ||
             blockData.getMetadata().containsKey(INCREMENTAL_CHUNK_LIST)) {
+          // Runs at both the write stage and the apply stage of a Ratis PutBlock; closing the cached channel and
+          // verifying the file exists is idempotent.
           chunkManager.finishWriteChunks(kvContainer, blockData);
         }
         endOfBlock = true;
@@ -698,7 +700,9 @@ public class KeyValueHandler extends Handler {
       long bcsId =
           dispatcherContext == null ? 0 : dispatcherContext.getLogIndex();
       blockData.setBlockCommitSequenceId(bcsId);
-      blockManager.putBlock(kvContainer, blockData, endOfBlock);
+      // A write-stage PutBlock persists the block record but leaves the container BCSID to the apply stage.
+      boolean writeStage = DispatcherContext.op(dispatcherContext) == DispatcherContext.Op.WRITE_STATE_MACHINE_DATA;
+      blockManager.putBlock(kvContainer, blockData, endOfBlock, !writeStage);
 
       blockDataProto = blockData.getProtoBufMessage();
 

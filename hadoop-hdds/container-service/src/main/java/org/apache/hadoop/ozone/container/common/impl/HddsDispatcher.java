@@ -480,7 +480,9 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
   private void updateBCSID(Container container,
       DispatcherContext dispatcherContext, Type cmdType) {
     if (dispatcherContext != null && (cmdType == Type.PutBlock
-        || cmdType == Type.PutSmallFile)) {
+        || cmdType == Type.PutSmallFile)
+        && DispatcherContext.op(dispatcherContext) != DispatcherContext.Op.WRITE_STATE_MACHINE_DATA) {
+      // A write-stage PutBlock does not move the container BCSID, so the committed-only map is left alone.
       Objects.requireNonNull(container, "container == null");
       long bcsID = container.getBlockCommitSequenceId();
       long containerId = container.getContainerData().getContainerID();

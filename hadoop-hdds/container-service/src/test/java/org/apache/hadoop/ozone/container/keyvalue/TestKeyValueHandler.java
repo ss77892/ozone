@@ -66,6 +66,7 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -104,17 +105,20 @@ import org.apache.hadoop.ozone.container.common.impl.ContainerLayoutVersion;
 import org.apache.hadoop.ozone.container.common.impl.ContainerSet;
 import org.apache.hadoop.ozone.container.common.impl.HddsDispatcher;
 import org.apache.hadoop.ozone.container.common.interfaces.Container;
+import org.apache.hadoop.ozone.container.common.interfaces.DBHandle;
 import org.apache.hadoop.ozone.container.common.interfaces.Handler;
 import org.apache.hadoop.ozone.container.common.report.IncrementalReportSender;
 import org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration;
 import org.apache.hadoop.ozone.container.common.statemachine.StateContext;
 import org.apache.hadoop.ozone.container.common.transport.server.ratis.DispatcherContext;
+import org.apache.hadoop.ozone.container.common.transport.server.ratis.DispatcherContext.Op;
 import org.apache.hadoop.ozone.container.common.utils.StorageVolumeUtil;
 import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
 import org.apache.hadoop.ozone.container.common.volume.MutableVolumeSet;
 import org.apache.hadoop.ozone.container.common.volume.RoundRobinVolumeChoosingPolicy;
 import org.apache.hadoop.ozone.container.common.volume.StorageVolume;
 import org.apache.hadoop.ozone.container.common.volume.VolumeSet;
+import org.apache.hadoop.ozone.container.keyvalue.helpers.BlockUtils;
 import org.apache.hadoop.ozone.container.ozoneimpl.ContainerController;
 import org.apache.hadoop.ozone.container.ozoneimpl.ContainerScannerConfiguration;
 import org.apache.hadoop.ozone.container.ozoneimpl.OnDemandContainerScanner;
@@ -959,6 +963,70 @@ public class TestKeyValueHandler {
       assertEquals(ContainerProtos.ContainerDataProto.State.CLOSED, container.getContainerState());
     } finally {
       FileUtils.deleteDirectory(tempDir.toFile());
+    }
+  }
+
+  /**
+   * A PutBlock dispatched at the Ratis write stage (WRITE_STATE_MACHINE_DATA) persists the block record with the
+   * log index as its BCSID but leaves the container BCSID untouched; the apply-stage PutBlock of the same
+   * transaction then moves the container BCSID without counting the block twice.
+   */
+  @ContainerLayoutTestInfo.ContainerTest
+  public void testPutBlockWriteStageLeavesContainerBcsId(ContainerLayoutVersion layoutVersion) throws Exception {
+    conf.set(OZONE_SCM_CONTAINER_LAYOUT_KEY, layoutVersion.name());
+    HandlerWithVolumeSet handlerCtx = createKeyValueHandler(tempDir);
+    KeyValueHandler kvHandler = handlerCtx.getHandler();
+    MutableVolumeSet volumeSet = handlerCtx.getVolumeSet();
+
+    long containerID = ContainerTestHelper.getTestContainerID();
+    KeyValueContainerData containerData = new KeyValueContainerData(containerID, layoutVersion,
+        (long) StorageUnit.GB.toBytes(1), UUID.randomUUID().toString(), DATANODE_UUID);
+    KeyValueContainer container = new KeyValueContainer(containerData, conf);
+    container.create(volumeSet, new RoundRobinVolumeChoosingPolicy(), CLUSTER_ID);
+    handlerCtx.getContainerSet().addContainer(container);
+
+    BlockID blockID = ContainerTestHelper.getTestBlockID(containerID);
+    ChunkInfo chunkInfo = new ChunkInfo("chunk1", 0, 1024);
+    kvHandler.getChunkManager().writeChunk(container, blockID, chunkInfo,
+        ChunkBuffer.wrap(ByteBuffer.allocate(1024)), DispatcherContext.getHandleWriteChunk());
+
+    ContainerCommandRequestProto putBlockRequest = ContainerCommandRequestProto.newBuilder()
+        .setCmdType(ContainerProtos.Type.PutBlock)
+        .setContainerID(containerID)
+        .setDatanodeUuid(DATANODE_UUID)
+        .setPutBlock(ContainerProtos.PutBlockRequestProto.newBuilder()
+            .setBlockData(ContainerProtos.BlockData.newBuilder()
+                .setBlockID(blockID.getDatanodeBlockIDProtobuf())
+                .setSize(1024)
+                .addChunks(chunkInfo.getProtoBufMessage())))
+        .build();
+    Map<Long, Long> container2BCSIDMap = new HashMap<>();
+    container2BCSIDMap.put(containerID, 0L);
+
+    try (DBHandle db = BlockUtils.getDB(containerData, conf)) {
+      Long bcsIdInDb = db.getStore().getMetadataTable().get(containerData.getBcsIdKey());
+
+      // Write stage: block record lands with BCSID 7, container BCSID (memory and DB) stays where it was.
+      DispatcherContext writeStage = DispatcherContext.newBuilder(Op.WRITE_STATE_MACHINE_DATA)
+          .setLogIndex(7).setContainer2BCSIDMap(container2BCSIDMap).build();
+      ContainerCommandResponseProto response = kvHandler.handle(putBlockRequest, container, writeStage);
+      assertEquals(ContainerProtos.Result.SUCCESS, response.getResult());
+      BlockData stored = kvHandler.getBlockManager().getBlock(container, blockID);
+      assertEquals(7, stored.getBlockCommitSequenceId());
+      assertEquals(0, container.getBlockCommitSequenceId());
+      assertEquals(bcsIdInDb, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+      assertEquals(1, containerData.getBlockCount());
+      assertEquals(1, db.getStore().getMetadataTable().get(containerData.getBlockCountKey()));
+
+      // Apply stage of the same transaction: container BCSID advances to 7, the block is not counted again.
+      DispatcherContext applyStage = DispatcherContext.newBuilder(Op.APPLY_TRANSACTION)
+          .setLogIndex(7).setContainer2BCSIDMap(container2BCSIDMap).build();
+      response = kvHandler.handle(putBlockRequest, container, applyStage);
+      assertEquals(ContainerProtos.Result.SUCCESS, response.getResult());
+      assertEquals(7, container.getBlockCommitSequenceId());
+      assertEquals(7, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+      assertEquals(1, containerData.getBlockCount());
+      assertEquals(1, db.getStore().getMetadataTable().get(containerData.getBlockCountKey()));
     }
   }
 
