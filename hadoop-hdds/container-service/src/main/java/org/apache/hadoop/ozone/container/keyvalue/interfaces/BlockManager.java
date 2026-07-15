@@ -53,6 +53,22 @@ public interface BlockManager {
       throws IOException;
 
   /**
+   * Puts or overwrites a block, optionally without advancing the container BCSID.
+   * When {@code updateContainerBcsId} is false the block record is persisted with the BCSID it carries, but
+   * neither the {@code bcsIdKey} metadata entry nor the in-memory container BCSID is advanced. This is used by
+   * the Ratis write stage of PutBlock; the apply stage performs the full put.
+   *
+   * @param container - Container for which block need to be added.
+   * @param data - Block Data.
+   * @param endOfBlock - The last putBlock call for this block (when
+   *                     all the chunks are written and stream is closed)
+   * @param updateContainerBcsId - whether to advance the container BCSID to the block's BCSID.
+   * @return length of the Block.
+   */
+  long putBlock(Container container, BlockData data, boolean endOfBlock, boolean updateContainerBcsId)
+      throws IOException;
+
+  /**
    * Persists the block data for a closed container. The block data should have all the chunks and bcsId.
    * Overwrites the block if it already exists, The container's used bytes should be updated by the caller with
    * {@link ChunkManager#writeChunk(Container, BlockID, ChunkInfo, ByteBuffer, DispatcherContext)}.

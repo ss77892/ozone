@@ -88,6 +88,7 @@ public class DatanodeConfiguration extends ReconfigurableConfig {
       0.015f;
 
   public static final String WAIT_ON_ALL_FOLLOWERS = "hdds.datanode.wait.on.all.followers";
+  public static final String ALL_REPLICA_APPLIED_ACK = "hdds.datanode.all.replica.applied.ack";
   public static final String CONTAINER_SCHEMA_V3_ENABLED = "hdds.datanode.container.schema.v3.enabled";
   public static final String CONTAINER_CHECKSUM_LOCK_STRIPES_KEY = "hdds.datanode.container.checksum.lock.stripes";
   public static final String CONTAINER_CLIENT_CACHE_SIZE = "hdds.datanode.container.client.cache.size";
@@ -107,6 +108,8 @@ public class DatanodeConfiguration extends ReconfigurableConfig {
   public static final int DISK_CHECK_FILE_SIZE_DEFAULT = 100;
 
   static final boolean WAIT_ON_ALL_FOLLOWERS_DEFAULT = false;
+
+  static final boolean ALL_REPLICA_APPLIED_ACK_DEFAULT = false;
 
   static final Duration DISK_CHECK_MIN_GAP_DEFAULT = Duration.ofMinutes(10);
 
@@ -535,6 +538,19 @@ public class DatanodeConfiguration extends ReconfigurableConfig {
 
   private boolean waitOnAllFollowers = WAIT_ON_ALL_FOLLOWERS_DEFAULT;
 
+  @Config(key = "hdds.datanode.all.replica.applied.ack",
+      defaultValue = "false",
+      type = ConfigType.BOOLEAN,
+      tags = { DATANODE },
+      description = "When enabled, this datanode as Ratis leader attaches state-machine data to PutBlock so every "
+          + "peer applies the block metadata before appending the entry, and it closes a container directly "
+          + "instead of quasi-closing it when its pipeline is gone. Every datanode in the cluster must run a "
+          + "version with this feature before enabling it: an older follower would close its Ratis division on "
+          + "such an entry. A datanode with this code honours a PutBlock entry carrying state-machine data "
+          + "regardless of its own setting."
+  )
+  private boolean allReplicaAppliedAck = ALL_REPLICA_APPLIED_ACK_DEFAULT;
+
   @Config(key = "hdds.datanode.container.schema.v3.enabled",
       defaultValue = "true",
       type = ConfigType.BOOLEAN,
@@ -957,6 +973,14 @@ public class DatanodeConfiguration extends ReconfigurableConfig {
 
   public void setWaitOnAllFollowers(boolean val) {
     this.waitOnAllFollowers = val;
+  }
+
+  public boolean isAllReplicaAppliedAck() {
+    return allReplicaAppliedAck;
+  }
+
+  public void setAllReplicaAppliedAck(boolean val) {
+    this.allReplicaAppliedAck = val;
   }
 
   public int getContainerDeleteThreads() {

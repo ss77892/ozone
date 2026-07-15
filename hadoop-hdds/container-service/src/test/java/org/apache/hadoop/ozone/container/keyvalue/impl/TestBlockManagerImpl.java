@@ -174,6 +174,52 @@ public class TestBlockManagerImpl {
   }
 
   @ContainerTestVersionInfo.ContainerTest
+  public void testPutBlockWithoutContainerBcsIdUpdate(ContainerTestVersionInfo versionInfo)
+      throws Exception {
+    initTest(versionInfo);
+    KeyValueContainerData containerData = keyValueContainer.getContainerData();
+    assertEquals(0, containerData.getBlockCount());
+    assertEquals(0, containerData.getBlockCommitSequenceId());
+    // blockData's BlockID still carries bcsId 0, so getBlock passes verifyBCSId while the container BCSID is 0.
+    BlockID readId = new BlockID(blockData.getContainerID(), blockData.getLocalID());
+
+    try (DBHandle db = BlockUtils.getDB(containerData, config)) {
+      Long bcsIdInDb = db.getStore().getMetadataTable().get(containerData.getBcsIdKey());
+
+      // 1. Write-stage put: block record carries bcsId 5, the container BCSID must not move.
+      blockData.setBlockCommitSequenceId(5);
+      blockManager.putBlock(keyValueContainer, blockData, true, false);
+
+      BlockData fromGetBlockData = blockManager.getBlock(keyValueContainer, readId);
+      assertEquals(5, fromGetBlockData.getBlockCommitSequenceId());
+      assertEquals(1, containerData.getBlockCount());
+      assertEquals(1, db.getStore().getMetadataTable().get(containerData.getBlockCountKey()));
+      assertEquals(0, containerData.getBlockCommitSequenceId());
+      assertEquals(bcsIdInDb, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+
+      // 2. Apply-stage put of the same block: the container BCSID advances, the block is not counted twice.
+      blockManager.putBlock(keyValueContainer, blockData, true, true);
+
+      fromGetBlockData = blockManager.getBlock(keyValueContainer, blockData.getBlockID());
+      assertEquals(5, fromGetBlockData.getBlockCommitSequenceId());
+      assertEquals(1, containerData.getBlockCount());
+      assertEquals(1, db.getStore().getMetadataTable().get(containerData.getBlockCountKey()));
+      assertEquals(5, containerData.getBlockCommitSequenceId());
+      assertEquals(5, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+
+      // 3. A lower re-put (bcsId 3) is ignored by the bcsId <= container BCSID guard, flag or not.
+      blockData.setBlockCommitSequenceId(3);
+      blockManager.putBlock(keyValueContainer, blockData, true, false);
+
+      fromGetBlockData = blockManager.getBlock(keyValueContainer, readId);
+      assertEquals(5, fromGetBlockData.getBlockCommitSequenceId());
+      assertEquals(1, containerData.getBlockCount());
+      assertEquals(5, containerData.getBlockCommitSequenceId());
+      assertEquals(5, db.getStore().getMetadataTable().get(containerData.getBcsIdKey()));
+    }
+  }
+
+  @ContainerTestVersionInfo.ContainerTest
   public void testPutAndGetBlock(ContainerTestVersionInfo versionInfo)
       throws Exception {
     initTest(versionInfo);

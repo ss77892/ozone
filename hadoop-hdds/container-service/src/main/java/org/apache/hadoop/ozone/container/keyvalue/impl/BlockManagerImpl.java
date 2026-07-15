@@ -94,9 +94,15 @@ public class BlockManagerImpl implements BlockManager {
   @Override
   public long putBlock(Container container, BlockData data,
       boolean endOfBlock) throws IOException {
+    return putBlock(container, data, endOfBlock, true);
+  }
+
+  @Override
+  public long putBlock(Container container, BlockData data, boolean endOfBlock, boolean updateContainerBcsId)
+      throws IOException {
     return persistPutBlock(
         (KeyValueContainer) container,
-        data, endOfBlock);
+        data, endOfBlock, updateContainerBcsId);
   }
 
   /**
@@ -184,6 +190,12 @@ public class BlockManagerImpl implements BlockManager {
   public long persistPutBlock(KeyValueContainer container,
       BlockData data, boolean endOfBlock)
       throws IOException {
+    return persistPutBlock(container, data, endOfBlock, true);
+  }
+
+  public long persistPutBlock(KeyValueContainer container,
+      BlockData data, boolean endOfBlock, boolean updateContainerBcsId)
+      throws IOException {
     Objects.requireNonNull(data, "data == null");
     Preconditions.checkState(data.getContainerID() >= 0, "Container Id " +
         "cannot be negative");
@@ -261,7 +273,7 @@ public class BlockManagerImpl implements BlockManager {
         }
         db.getStore().putBlockByID(batch, incrementalEnabled, localID, data,
             containerData, endOfBlock);
-        if (bcsId != 0) {
+        if (updateContainerBcsId && bcsId != 0) {
           db.getStore().getMetadataTable().putWithBatch(
               batch, containerData.getBcsIdKey(), bcsId);
         }
@@ -283,7 +295,7 @@ public class BlockManagerImpl implements BlockManager {
         db.getStore().getBatchHandler().commitBatchOperation(batch);
       }
 
-      if (bcsId != 0) {
+      if (updateContainerBcsId && bcsId != 0) {
         container.updateBlockCommitSequenceId(bcsId);
       }
 
