@@ -21,8 +21,10 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.opentelemetry.api.trace.SpanKind;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -87,6 +89,7 @@ public final class XceiverClientRatis extends XceiverClientSpi {
   private final XceiverClientMetrics metrics
       = XceiverClientManager.getXceiverClientMetrics();
   private final RaftProtos.ReplicationLevel watchType;
+  private final boolean allReplicaAppliedAck;
   private final int majority;
   private final ErrorInjector errorInjector;
 
@@ -116,7 +119,13 @@ public final class XceiverClientRatis extends XceiverClientSpi {
       throw new IllegalArgumentException(watchType + " is not supported. " +
           "Currently only ALL_COMMITTED or MAJORITY_COMMITTED are supported");
     }
-    LOG.debug("WatchType {}. Majority {}, ", this.watchType, this.majority);
+    this.allReplicaAppliedAck = configuration.getObject(OzoneClientConfig.class).isAllReplicaAppliedAck();
+    if (allReplicaAppliedAck && watchType != ReplicationLevel.ALL_COMMITTED) {
+      throw new IllegalArgumentException("ozone.client.all.replica.applied.ack requires " +
+          "hdds.ratis.client.request.watch.type = ALL_COMMITTED, but it is " + watchType);
+    }
+    LOG.debug("WatchType {}. Majority {}, allReplicaAppliedAck {}", this.watchType, this.majority,
+        this.allReplicaAppliedAck);
     if (LOG.isTraceEnabled()) {
       LOG.trace("new XceiverClientRatis for pipeline " + pipeline.getId(),
           new Throwable("TRACE"));
@@ -306,14 +315,32 @@ public final class XceiverClientRatis extends XceiverClientSpi {
     }
 
     final CompletableFuture<XceiverClientReply> replyFuture = new CompletableFuture<>();
-    getClient().async().watch(index, watchType).thenAccept(reply -> {
+    watchAsync(index, watchType).thenAccept(reply -> {
       final long updated = updateCommitInfosMap(reply, watchType);
       Preconditions.checkState(updated >= index, "Returned index %s < expected %s", updated, index);
       replyFuture.complete(newWatchReply(index, watchType, updated));
     }).exceptionally(e -> {
       LOG.warn("{} way commit failed on pipeline {}", watchType, pipeline, e);
       final boolean isGroupMismatch = HddsClientUtils.containsException(e, GroupMismatchException.class) != null;
-      if (!isGroupMismatch && watchType == ReplicationLevel.ALL_COMMITTED) {
+      if (allReplicaAppliedAck) {
+        // No majority fallback: the write must be applied on every replica, so the watch failure is final.
+        // commitInfoMap is left untouched so that getReplicatedMinCommitIndex() keeps answering from all nodes.
+        final Throwable nre = HddsClientUtils.containsException(e, NotReplicatedException.class);
+        if (nre instanceof NotReplicatedException) {
+          final List<DatanodeDetails> failedDatanodes = new ArrayList<>();
+          for (CommitInfoProto proto : ((NotReplicatedException) nre).getCommitInfos()) {
+            if (proto.getCommitIndex() < index) {
+              failedDatanodes.add(DatanodeDetails.newBuilder().setUuid(RatisHelper.toDatanodeId(proto.getServer()))
+                  .build());
+            }
+          }
+          LOG.warn("Index {} was not applied on all replicas of pipeline {}; lagging datanodes {}", index, pipeline,
+              failedDatanodes);
+          replyFuture.completeExceptionally(new AllReplicaWatchFailedException(index, failedDatanodes, e));
+        } else {
+          replyFuture.completeExceptionally(e);
+        }
+      } else if (!isGroupMismatch && watchType == ReplicationLevel.ALL_COMMITTED) {
         final Throwable nre = HddsClientUtils.containsException(e, NotReplicatedException.class);
         if (nre instanceof NotReplicatedException) {
           // If NotReplicatedException is thrown from the Datanode leader
@@ -322,7 +349,7 @@ public final class XceiverClientRatis extends XceiverClientSpi {
           final Collection<CommitInfoProto> commitInfoProtoList = ((NotReplicatedException) nre).getCommitInfos();
           replyFuture.complete(handleFailedAllCommit(index, commitInfoProtoList));
         } else {
-          getClient().async().watch(index, ReplicationLevel.MAJORITY_COMMITTED)
+          watchAsync(index, ReplicationLevel.MAJORITY_COMMITTED)
               .thenApply(reply -> handleFailedAllCommit(index, reply.getCommitInfos()))
               .whenComplete(JavaUtils.asBiConsumer(replyFuture));
         }
@@ -332,6 +359,16 @@ public final class XceiverClientRatis extends XceiverClientSpi {
       return null;
     });
     return replyFuture;
+  }
+
+  private CompletableFuture<RaftClientReply> watchAsync(long index, ReplicationLevel level) {
+    if (errorInjector != null) {
+      final CompletableFuture<RaftClientReply> injected = errorInjector.watch(index, level, pipeline);
+      if (injected != null) {
+        return injected;
+      }
+    }
+    return getClient().async().watch(index, level);
   }
 
   private XceiverClientReply handleFailedAllCommit(long index, Collection<CommitInfoProto> commitInfoProtoList) {

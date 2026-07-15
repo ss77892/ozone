@@ -17,8 +17,10 @@
 
 package org.apache.hadoop.hdds.scm;
 
+import java.util.concurrent.CompletableFuture;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
 
@@ -28,4 +30,13 @@ import org.apache.ratis.protocol.RaftClientReply;
 @FunctionalInterface
 public interface ErrorInjector {
   RaftClientReply getResponse(ContainerProtos.ContainerCommandRequestProto request, ClientId id, Pipeline pipeline);
+
+  /**
+   * Intercepts a watch request issued by {@link XceiverClientRatis#watchForCommit(long)}.
+   *
+   * @return the reply future to use instead of the RaftClient watch, or null to issue the real watch
+   */
+  default CompletableFuture<RaftClientReply> watch(long index, RaftProtos.ReplicationLevel level, Pipeline pipeline) {
+    return null;
+  }
 }
