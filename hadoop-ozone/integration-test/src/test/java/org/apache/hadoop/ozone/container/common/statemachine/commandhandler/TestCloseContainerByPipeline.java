@@ -21,9 +21,11 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.ONE;
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.THREE;
 import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_DATANODE_PIPELINE_LIMIT;
+import static org.apache.hadoop.ozone.container.OzoneTestHelper.validateData;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -47,9 +49,11 @@ import org.apache.hadoop.ozone.client.ObjectStore;
 import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.client.OzoneClientFactory;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
+import org.apache.hadoop.ozone.container.common.helpers.BlockData;
 import org.apache.hadoop.ozone.container.common.impl.ContainerData;
 import org.apache.hadoop.ozone.container.common.interfaces.Container;
 import org.apache.hadoop.ozone.container.common.interfaces.DBHandle;
+import org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration;
 import org.apache.hadoop.ozone.container.keyvalue.KeyValueContainerData;
 import org.apache.hadoop.ozone.container.keyvalue.helpers.BlockUtils;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
@@ -328,6 +332,101 @@ public class TestCloseContainerByPipeline {
         .waitFor(() -> isContainerClosed(
             cluster, containerID, datanodeDetails), 500, 5 * 1000);
     assertTrue(isContainerClosed(cluster, containerID, datanodeDetails));
+  }
+
+  /**
+   * With hdds.datanode.all.replica.applied.ack on every datanode and
+   * ozone.client.all.replica.applied.ack on a dedicated client, a closed key
+   * has its block record on all three replicas as soon as close() returns, and
+   * closing the pipeline takes the container to CLOSED without passing through
+   * QUASI_CLOSED. The shared static client stays in default mode; it was built
+   * from the original conf and restarting datanodes does not change it.
+   */
+  @Test
+  public void testAllReplicaAppliedAckClosesDirectly() throws Exception {
+    String keyName = "testAllReplicaAppliedAckClosesDirectly";
+    byte[] data = keyName.getBytes(UTF_8);
+    OzoneConfiguration modeOnConf = new OzoneConfiguration(conf);
+    modeOnConf.setBoolean("ozone.client.all.replica.applied.ack", true);
+    modeOnConf.setBoolean("ozone.client.stream.putblock.piggybacking", false);
+    modeOnConf.setBoolean("ozone.client.incremental.chunk.list", false);
+
+    setDatanodeAllReplicaAppliedAck(true);
+    try (OzoneClient modeOnClient = OzoneClientFactory.getRpcClient(modeOnConf)) {
+      OzoneOutputStream key = modeOnClient.getObjectStore().getVolume("test").getBucket("test")
+          .createKey(keyName, 1024, ReplicationType.RATIS, ReplicationFactor.THREE, new HashMap<>());
+      key.write(data);
+      key.close();
+
+      OmKeyArgs keyArgs = new OmKeyArgs.Builder().setVolumeName("test").setBucketName("test")
+          .setReplicationConfig(RatisReplicationConfig.getInstance(THREE))
+          .setDataSize(1024)
+          .setKeyName(keyName).build();
+      OmKeyLocationInfo omKeyLocationInfo =
+          cluster.getOzoneManager().lookupKey(keyArgs).getKeyLocationVersions()
+              .get(0).getBlocksLatestVersionOnly().get(0);
+
+      long containerID = omKeyLocationInfo.getContainerID();
+      long localID = omKeyLocationInfo.getLocalID();
+      long bcsId = omKeyLocationInfo.getBlockCommitSequenceId();
+      ContainerInfo container = cluster.getStorageContainerManager()
+          .getContainerManager().getContainer(ContainerID.valueOf(containerID));
+      Pipeline pipeline = cluster.getStorageContainerManager()
+          .getPipelineManager().getPipeline(container.getPipelineID());
+      List<DatanodeDetails> datanodes = pipeline.getNodes();
+      assertEquals(3, datanodes.size());
+
+      // No wait: the acknowledged PutBlock was applied on every replica before close() returned.
+      for (DatanodeDetails datanodeDetails : datanodes) {
+        KeyValueContainerData containerData = getContainerData(containerID, datanodeDetails);
+        assertFalse(containerData.isClosed());
+        assertFalse(containerData.isQuasiClosed());
+        try (DBHandle db = BlockUtils.getDB(containerData, conf)) {
+          BlockData blockData = db.getStore().getBlockDataTable().get(containerData.getBlockKey(localID));
+          assertNotNull(blockData, "block " + localID + " missing on " + datanodeDetails);
+          assertEquals(bcsId, blockData.getBlockCommitSequenceId(), "block BCSID on " + datanodeDetails);
+        }
+      }
+
+      cluster.getStorageContainerManager().getPipelineManager().closePipeline(pipeline.getId());
+
+      // Every replica goes straight to CLOSED; none is ever observed QUASI_CLOSED.
+      for (DatanodeDetails datanodeDetails : datanodes) {
+        GenericTestUtils.waitFor(() -> {
+          assertFalse(isContainerQuasiClosed(cluster, containerID, datanodeDetails),
+              "container " + containerID + " quasi-closed on " + datanodeDetails);
+          return isContainerClosed(cluster, containerID, datanodeDetails);
+        }, 500, 15 * 1000);
+        assertTrue(isContainerClosed(cluster, containerID, datanodeDetails));
+        assertFalse(isContainerQuasiClosed(cluster, containerID, datanodeDetails));
+      }
+
+      validateData(keyName, data, modeOnClient.getObjectStore(), "test", "test");
+    } finally {
+      setDatanodeAllReplicaAppliedAck(false);
+    }
+  }
+
+  /**
+   * Toggles hdds.datanode.all.replica.applied.ack on every datanode through a
+   * rolling restart: the restarted datanode is rebuilt from its own conf, so
+   * the key takes effect, and the shared static client is not affected.
+   */
+  private static void setDatanodeAllReplicaAppliedAck(boolean enabled) throws Exception {
+    for (int i = 0; i < cluster.getHddsDatanodes().size(); i++) {
+      cluster.getHddsDatanodes().get(i).getConf()
+          .setBoolean(DatanodeConfiguration.ALL_REPLICA_APPLIED_ACK, enabled);
+      cluster.restartHddsDatanode(i, false);
+    }
+    cluster.waitForClusterToBeReady();
+    cluster.waitForPipelineTobeReady(THREE, 60 * 1000);
+  }
+
+  private KeyValueContainerData getContainerData(long containerID, DatanodeDetails datanode) throws IOException {
+    int index = cluster.getHddsDatanodeIndex(datanode);
+    return (KeyValueContainerData) cluster.getHddsDatanodes().get(index)
+        .getDatanodeStateMachine().getContainer().getContainerSet()
+        .getContainer(containerID).getContainerData();
   }
 
   private Boolean isContainerClosed(MiniOzoneCluster ozoneCluster,

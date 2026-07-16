@@ -18,6 +18,7 @@
 package org.apache.hadoop.ozone.client.rpc;
 
 import static org.apache.hadoop.hdds.scm.client.HddsClientUtils.checkForException;
+import static org.apache.hadoop.hdds.scm.client.HddsClientUtils.containsException;
 import static org.apache.hadoop.ozone.client.rpc.TestBlockOutputStream.BLOCK_SIZE;
 import static org.apache.hadoop.ozone.client.rpc.TestBlockOutputStream.BUCKET;
 import static org.apache.hadoop.ozone.client.rpc.TestBlockOutputStream.CHUNK_SIZE;
@@ -33,6 +34,7 @@ import static org.apache.hadoop.ozone.container.OzoneTestHelper.validateData;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -41,6 +43,8 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.hdds.client.ReplicationFactor;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.scm.AllReplicaWatchFailedException;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
 import org.apache.hadoop.hdds.scm.XceiverClientRatis;
 import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerNotOpenException;
@@ -52,8 +56,10 @@ import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.client.io.KeyOutputStream;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
 import org.apache.hadoop.ozone.container.OzoneTestHelper;
+import org.apache.hadoop.ozone.container.common.statemachine.DatanodeConfiguration;
 import org.apache.ozone.test.tag.Flaky;
 import org.apache.ratis.protocol.exceptions.GroupMismatchException;
+import org.apache.ratis.protocol.exceptions.NotReplicatedException;
 import org.apache.ratis.protocol.exceptions.RaftRetryFailureException;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -61,6 +67,7 @@ import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Tests failure detection and handling in BlockOutputStream Class.
@@ -267,6 +274,94 @@ class TestBlockOutputStreamWithFailures {
       // Written the same data twice
       byte[] bytes = ArrayUtils.addAll(data1, data1);
       validateData(keyName, bytes, client.getObjectStore(), VOLUME, BUCKET);
+    }
+  }
+
+  /**
+   * Same shape as {@link #testWatchForCommitDatanodeFailure}, but with
+   * hdds.datanode.all.replica.applied.ack on every datanode and
+   * ozone.client.all.replica.applied.ack on the client (piggybacking off).
+   * Losing a datanode then fails the ALL_COMMITTED watch for good instead of
+   * falling back to a majority commit: the block is abandoned, the stopped
+   * datanode is excluded and the buffered data is rewritten to a new block.
+   */
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void testWatchForCommitDatanodeFailureAllReplicaAppliedAck(boolean flushDelay) throws Exception {
+    setDatanodeAllReplicaAppliedAck(true);
+    try {
+      OzoneClientConfig config = newClientConfig(cluster.getConf(), flushDelay, false);
+      config.setIncrementalChunkList(false);
+      config.setAllReplicaAppliedAck(true);
+      try (OzoneClient client = newClient(cluster.getConf(), config)) {
+        String keyName = getKeyName();
+        int dataLength = MAX_FLUSH_SIZE + CHUNK_SIZE;
+        byte[] data1 = RandomUtils.secure().randomBytes(dataLength);
+        KeyOutputStream keyOutputStream;
+        RatisBlockOutputStream blockOutputStream;
+        try (OzoneOutputStream key = createKey(client, keyName)) {
+          key.write(data1);
+          keyOutputStream = assertInstanceOf(KeyOutputStream.class, key.getOutputStream());
+
+          assertEquals(1, keyOutputStream.getStreamEntries().size());
+          blockOutputStream = assertInstanceOf(RatisBlockOutputStream.class,
+              keyOutputStream.getStreamEntries().get(0).getOutputStream());
+
+          assertEquals(4, blockOutputStream.getBufferPool().getSize());
+          assertEquals(dataLength, blockOutputStream.getWrittenDataLength());
+          assertEquals(MAX_FLUSH_SIZE, blockOutputStream.getTotalDataFlushedLength());
+          assertThat(blockOutputStream.getTotalAckDataLength())
+              .isGreaterThanOrEqualTo(FLUSH_SIZE);
+
+          // flush is a sync call: everything written so far is applied on all three replicas
+          key.flush();
+
+          assertEquals(4, blockOutputStream.getBufferPool().getSize());
+          assertEquals(dataLength, blockOutputStream.getWrittenDataLength());
+          assertEquals(dataLength, blockOutputStream.getTotalDataFlushedLength());
+          assertEquals(dataLength, blockOutputStream.getTotalAckDataLength());
+          assertEquals(0, blockOutputStream.getCommitIndex2flushedDataMap().size());
+
+          XceiverClientRatis raftClient =
+              (XceiverClientRatis) blockOutputStream.getXceiverClient();
+          assertEquals(3, raftClient.getCommitInfoMap().size());
+          Pipeline pipeline = raftClient.getPipeline();
+          DatanodeDetails stoppedDatanode = pipeline.getNodes().get(0);
+          stopAndRemove(stoppedDatanode);
+
+          // The next watchForCommit cannot be satisfied by all replicas any more.
+          // There is no majority fallback, so the write fails on this block and
+          // the buffered data is retried on a new block allocated elsewhere.
+          key.write(data1);
+          key.flush();
+
+          IOException ioException = blockOutputStream.getIoException();
+          assertNotNull(ioException);
+          assertTrue(checkForException(ioException) instanceof NotReplicatedException
+                  || containsException(ioException, AllReplicaWatchFailedException.class) != null,
+              "unexpected failure: " + ioException);
+          // no data past the failure was acknowledged on the abandoned block
+          assertEquals(dataLength, blockOutputStream.getTotalAckDataLength());
+          // no eviction from the commit info map in this mode
+          assertEquals(3, raftClient.getCommitInfoMap().size());
+          // a new block was allocated on another pipeline
+          assertThat(keyOutputStream.getStreamEntries().size()).isGreaterThan(1);
+          assertThat(keyOutputStream.getExcludeList().getDatanodes()).contains(stoppedDatanode);
+          // Make sure the retryCount is reset after the exception is handled
+          assertEquals(0, keyOutputStream.getRetryCount());
+          // now close the stream, It will update ack length after watchForCommit
+        }
+        assertEquals(0, keyOutputStream.getRetryCount());
+        // make sure the bufferPool is empty
+        assertEquals(0, blockOutputStream.getBufferPool().computeBufferData());
+        assertEquals(0, blockOutputStream.getCommitIndex2flushedDataMap().size());
+        assertEquals(0, keyOutputStream.getStreamEntries().size());
+        // Written the same data twice
+        byte[] bytes = ArrayUtils.addAll(data1, data1);
+        validateData(keyName, bytes, client.getObjectStore(), VOLUME, BUCKET);
+      }
+    } finally {
+      setDatanodeAllReplicaAppliedAck(false);
     }
   }
 
@@ -755,6 +850,21 @@ class TestBlockOutputStreamWithFailures {
       byte[] bytes = ArrayUtils.addAll(data1, data1);
       validateData(keyName, bytes, client.getObjectStore(), VOLUME, BUCKET);
     }
+  }
+
+  /**
+   * Toggles hdds.datanode.all.replica.applied.ack on every running datanode
+   * through a rolling restart; a restarted datanode is rebuilt from its own
+   * conf, so the key takes effect for the Ratis groups it reloads.
+   */
+  private void setDatanodeAllReplicaAppliedAck(boolean enabled) throws Exception {
+    for (int i = 0; i < cluster.getHddsDatanodes().size(); i++) {
+      cluster.getHddsDatanodes().get(i).getConf()
+          .setBoolean(DatanodeConfiguration.ALL_REPLICA_APPLIED_ACK, enabled);
+      cluster.restartHddsDatanode(i, false);
+    }
+    cluster.waitForClusterToBeReady();
+    cluster.waitForPipelineTobeReady(HddsProtos.ReplicationFactor.THREE, 60 * 1000);
   }
 
   private void stopAndRemove(DatanodeDetails dn) throws IOException {
