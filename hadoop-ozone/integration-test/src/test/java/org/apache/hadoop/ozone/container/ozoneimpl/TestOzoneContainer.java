@@ -23,6 +23,7 @@ import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_KEY;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
@@ -45,12 +46,15 @@ import org.apache.hadoop.hdds.scm.pipeline.MockPipeline;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
+import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.container.ContainerTestHelper;
 import org.apache.hadoop.ozone.container.common.ContainerTestUtils;
 import org.apache.hadoop.ozone.container.common.utils.StorageVolumeUtil;
 import org.apache.ozone.test.GenericTestUtils;
 import org.apache.ozone.test.tag.Flaky;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.Timeout.ThreadMode;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -122,6 +126,45 @@ public class TestOzoneContainer {
 
       container.stop();
 
+    } finally {
+      if (container != null) {
+        container.stop();
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 300, threadMode = ThreadMode.SEPARATE_THREAD)
+  void testOzoneContainerStartAfterFailedStart(
+      @TempDir File ozoneMetaDir, @TempDir File hddsNodeDir) throws Exception {
+    OzoneConfiguration conf = newOzoneConfiguration();
+    OzoneContainer container = null;
+
+    try {
+      Pipeline pipeline = MockPipeline.createSingleNodePipeline();
+      conf.set(OZONE_METADATA_DIRS, ozoneMetaDir.getPath());
+      conf.set(HDDS_DATANODE_DIR_KEY, hddsNodeDir.getPath());
+      conf.setInt(OzoneConfigKeys.HDDS_CONTAINER_IPC_PORT,
+          pipeline.getFirstNode().getStandalonePort().getValue());
+
+      DatanodeDetails datanodeDetails = randomDatanodeDetails();
+      container = ContainerTestUtils
+          .getOzoneContainer(datanodeDetails, conf);
+      ContainerTestUtils.initializeDatanodeLayout(conf, datanodeDetails);
+
+      String clusterId = UUID.randomUUID().toString();
+      final OzoneContainer ozoneContainer = container;
+
+      // Drop the layout directory, so that the first start fails while
+      // persisting the layout, before any container service is started.
+      FileUtils.deleteDirectory(
+          new File(ozoneMetaDir, OzoneConsts.DATANODE_LAYOUT_VERSION_DIR));
+      assertThrows(IOException.class, () -> ozoneContainer.start(clusterId));
+
+      // A failed start must be retryable: if the container is left in the
+      // INITIALIZING state, this call never returns.
+      ContainerTestUtils.initializeDatanodeLayout(conf, datanodeDetails);
+      ozoneContainer.start(clusterId);
     } finally {
       if (container != null) {
         container.stop();

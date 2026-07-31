@@ -36,6 +36,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Maps;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -550,17 +551,38 @@ public class OzoneContainer {
         InitializingStatus.UNINITIALIZED, InitializingStatus.INITIALIZING)) {
 
       // wait OzoneContainer to finish its initializing.
-      while (initializingStatus.get() != InitializingStatus.INITIALIZED) {
+      while (initializingStatus.get() == InitializingStatus.INITIALIZING) {
         try {
           Thread.sleep(1);
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
+          throw new InterruptedIOException(
+              "Interrupted while waiting for OzoneContainer to be initialized.");
         }
+      }
+      if (initializingStatus.get() != InitializingStatus.INITIALIZED) {
+        // The thread which was initializing OzoneContainer failed and reset the
+        // status. Fail this call as well, so that the caller retries the start.
+        throw new IOException("OzoneContainer initialization failed.");
       }
       LOG.info("Ignore. OzoneContainer already started.");
       return;
     }
 
+    boolean initialized = false;
+    try {
+      initialize(clusterId);
+      initialized = true;
+    } finally {
+      // Leaving the status at INITIALIZING would make this and every later call
+      // wait in the loop above forever, so the datanode would never get past
+      // the version task and would never register with SCM again.
+      initializingStatus.set(initialized
+          ? InitializingStatus.INITIALIZED : InitializingStatus.UNINITIALIZED);
+    }
+  }
+
+  private void initialize(String clusterId) throws IOException {
     DatanodeLayoutStorage layoutStorage
         = new DatanodeLayoutStorage(config);
     layoutStorage.setClusterId(clusterId);
@@ -603,9 +625,6 @@ public class OzoneContainer {
     recoveringContainerScrubbingService.start();
 
     initHddsVolumeContainer();
-
-    // mark OzoneContainer as INITIALIZED.
-    initializingStatus.set(InitializingStatus.INITIALIZED);
   }
 
   /**
