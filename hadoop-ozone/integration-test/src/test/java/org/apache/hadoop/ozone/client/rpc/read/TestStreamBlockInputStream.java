@@ -17,14 +17,27 @@
 
 package org.apache.hadoop.ozone.client.rpc.read;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
+import org.apache.hadoop.fs.ByteBufferPositionedReadable;
+import org.apache.hadoop.fs.PositionedReadable;
+import org.apache.hadoop.fs.Seekable;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
@@ -33,6 +46,7 @@ import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.client.OzoneClientFactory;
 import org.apache.hadoop.ozone.client.io.KeyInputStream;
+import org.apache.hadoop.ozone.client.io.OzoneInputStream;
 import org.apache.hadoop.ozone.container.common.transport.server.GrpcXceiverService;
 import org.apache.hadoop.ozone.om.BucketForTesting;
 import org.apache.ozone.test.GenericTestUtils;
@@ -73,6 +87,11 @@ public class TestStreamBlockInputStream extends InputStreamTests {
   private static final int DATA_LENGTH = (2 * BLOCK_SIZE) + (CHUNK_SIZE);
   private byte[] inputData;
   private BucketForTesting bucket;
+
+  private static final int PREAD_THREADS = 8;
+  private static final int PREADS_PER_THREAD = 100;
+  private static final int MAX_PREAD_LENGTH = 64 * 1024;
+  private static final int MAX_SEQUENTIAL_ROUNDS = 10;
 
   @Test
   void testReadKey() throws Exception {
@@ -314,6 +333,137 @@ public class TestStreamBlockInputStream extends InputStreamTests {
     try (KeyInputStream keyInputStream = bucket.getKeyInputStream(keyName)) {
       assertTrue(keyInputStream.getPartStreams().isEmpty());
       assertEquals(-1, keyInputStream.read());
+    }
+  }
+
+  /**
+   * Positioned reads do not move the cursor of the stream and do not hold its lock, so many of them
+   * can run on a single stream concurrently with each other and with a sequential read.
+   */
+  @Test
+  void testConcurrentPositionedRead() throws Exception {
+    try (MiniOzoneCluster cluster = newCluster()) {
+      cluster.waitForClusterToBeReady();
+      OzoneConfiguration conf = cluster.getConf();
+      OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+      clientConfig.setStreamReadBlock(true);
+      OzoneConfiguration copy = new OzoneConfiguration(conf);
+      copy.setFromObject(clientConfig);
+
+      final String keyName = getNewKeyName();
+      try (OzoneClient client = OzoneClientFactory.getRpcClient(copy)) {
+        final BucketForTesting testBucket = BucketForTesting.newBuilder(client).build();
+        final byte[] data = testBucket.writeRandomBytes(keyName, DATA_LENGTH);
+
+        try (KeyInputStream in = testBucket.getKeyInputStream(keyName)) {
+          assertTrue(in.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+          runTestConcurrentPositionedRead(data, in);
+        }
+
+        // The same through the native OzoneInputStream API.
+        try (OzoneInputStream in = testBucket.delegate().readKey(keyName)) {
+          assertTrue(in.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+          runTestConcurrentPositionedRead(data, in);
+        }
+      }
+    }
+  }
+
+  private void runTestConcurrentPositionedRead(byte[] data, InputStream stream) throws Exception {
+    final ByteBufferPositionedReadable bufferReadable = (ByteBufferPositionedReadable) stream;
+    final PositionedReadable positionedReadable = (PositionedReadable) stream;
+    final CountDownLatch start = new CountDownLatch(1);
+    final List<Future<Void>> futures = new ArrayList<>(PREAD_THREADS);
+    final ExecutorService executor = Executors.newFixedThreadPool(PREAD_THREADS);
+    try {
+      for (int t = 0; t < PREAD_THREADS; t++) {
+        futures.add(executor.submit(() -> {
+          start.await();
+          for (int i = 0; i < PREADS_PER_THREAD; i++) {
+            assertPositionedRead(data, bufferReadable, positionedReadable, i);
+          }
+          return null;
+        }));
+      }
+      start.countDown();
+
+      // Read the key sequentially on the same stream while the positioned reads are running.
+      int rounds = 0;
+      do {
+        ((Seekable) stream).seek(0);
+        assertSequentialRead(data, stream);
+        rounds++;
+      } while (!isDone(futures) && rounds < MAX_SEQUENTIAL_ROUNDS);
+      LOG.info("sequential read rounds: {}", rounds);
+
+      for (Future<Void> future : futures) {
+        future.get();
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  private static boolean isDone(List<Future<Void>> futures) {
+    for (Future<Void> future : futures) {
+      if (!future.isDone()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private void assertSequentialRead(byte[] data, InputStream stream) throws IOException {
+    final byte[] buffer = new byte[CHUNK_SIZE];
+    int pos = 0;
+    while (pos < data.length) {
+      final int numBytesRead = stream.read(buffer, 0, buffer.length);
+      if (numBytesRead == -1) {
+        break;
+      }
+      for (int i = 0; i < numBytesRead; i++) {
+        assertEquals(data[pos + i], buffer[i], "pos=" + pos + ", i=" + i);
+      }
+      pos += numBytesRead;
+    }
+    assertEquals(data.length, pos);
+  }
+
+  private void assertPositionedRead(byte[] data, ByteBufferPositionedReadable bufferReadable,
+      PositionedReadable positionedReadable, int i) throws IOException {
+    final ThreadLocalRandom random = ThreadLocalRandom.current();
+    final int position;
+    final int length;
+    if (i % 2 == 0) {
+      // A read straddling one of the block boundaries.
+      final int boundary = BLOCK_SIZE * (1 + random.nextInt(data.length / BLOCK_SIZE));
+      final int before = 1 + random.nextInt(MAX_PREAD_LENGTH / 2);
+      position = boundary - before;
+      length = Math.min(before + random.nextInt(MAX_PREAD_LENGTH / 2) + 1, data.length - position);
+    } else {
+      position = random.nextInt(data.length);
+      length = 1 + random.nextInt(Math.min(MAX_PREAD_LENGTH, data.length - position));
+    }
+    final byte[] expected = Arrays.copyOfRange(data, position, position + length);
+
+    if (i % 4 < 2) {
+      final ByteBuffer buffer = ByteBuffer.allocate(length);
+      while (buffer.hasRemaining()) {
+        final int numBytesRead = bufferReadable.read(position + buffer.position(), buffer);
+        assertTrue(numBytesRead > 0, "read(long, ByteBuffer) at " + (position + buffer.position()));
+      }
+      assertArrayEquals(expected, buffer.array(),
+          "read(long, ByteBuffer) at position " + position + ", length " + length);
+    } else {
+      final byte[] buffer = new byte[length];
+      int done = 0;
+      while (done < length) {
+        final int numBytesRead = positionedReadable.read(position + done, buffer, done, length - done);
+        assertTrue(numBytesRead > 0, "read(long, byte[], int, int) at " + (position + done));
+        done += numBytesRead;
+      }
+      assertArrayEquals(expected, buffer,
+          "read(long, byte[], int, int) at position " + position + ", length " + length);
     }
   }
 }

@@ -2381,6 +2381,10 @@ public class KeyValueHandler extends Handler {
     LOG.debug("adjustedOffset {}, requiredLength {}, blockSize {}",
         adjustedOffset, requiredLength, blockData.getSize());
     for (boolean shouldRead = true; totalDataLength < requiredLength && shouldRead;) {
+      // Read only what is still required: the buffer is filled up to its limit, so without this a short read would
+      // still read, checksum and ship a whole responseDataSize. clear() below resets the limit to the capacity,
+      // hence the limit has to be set on every iteration.
+      buffer.limit(Math.toIntExact(Math.min(responseDataSize, requiredLength - totalDataLength)));
       shouldRead = blockFile.read(buffer);
       buffer.flip();
       final int readLength = buffer.remaining();

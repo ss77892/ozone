@@ -153,6 +153,8 @@ public class TestKeyValueHandler {
   // Deliberately not a multiple of BYTES_PER_CHECKSUM, so an offset past the end of the block can still have its
   // checksum aligned floor inside the block.
   private static final int BLOCK_SIZE = 1000;
+  // A block large enough for a read to span several 1 MiB responses.
+  private static final int FOUR_MIB = 4 << 20;
 
   private HddsDispatcher dispatcher;
   private KeyValueHandler handler;
@@ -1183,6 +1185,76 @@ public class TestKeyValueHandler {
     }
   }
 
+  /**
+   * A short read must ship only the checksum aligned range that covers it, not a whole response buffer.
+   */
+  @Test
+  public void testReadBlockShortReadIsNotPaddedToResponseDataSize() throws Exception {
+    ReadBlockResult result = readBlock(FOUR_MIB, 70_000, 100, 0);
+    assertSuccess(result);
+    assertEquals(1, result.getDataResponses().size(), "A 100 byte read must produce a single response");
+    assertEquals(65_536, result.getDataResponses().get(0).getReadBlock().getOffset());
+    assertEquals(65_536, result.getDataResponses().get(0).getReadBlock().getData().size());
+  }
+
+  /**
+   * A read spanning more than one response must not over-read past the aligned required range in its last response.
+   */
+  @Test
+  public void testReadBlockMultipleResponsesStopAtRequiredLength() throws Exception {
+    ReadBlockResult result = readBlock(FOUR_MIB, 0, 1_100_000, 0);
+    assertSuccess(result);
+    List<ContainerProtos.ReadBlockResponseProto> responses = new ArrayList<>();
+    for (ContainerCommandResponseProto response : result.getDataResponses()) {
+      responses.add(response.getReadBlock());
+    }
+    long expectedOffset = 0;
+    long total = 0;
+    for (ContainerProtos.ReadBlockResponseProto response : responses) {
+      assertEquals(expectedOffset, response.getOffset());
+      expectedOffset += response.getData().size();
+      total += response.getData().size();
+    }
+    assertEquals(1_114_112, total, "The responses must cover exactly roundUp(1_100_000, 65_536) bytes");
+    assertEquals(1_048_576, responses.get(0).getData().size());
+    assertEquals(65_536, responses.get(responses.size() - 1).getData().size());
+  }
+
+  /**
+   * The aligned required range is clamped at the end of the block, so a read near the end ships only the remainder.
+   */
+  @Test
+  public void testReadBlockAtBlockEndIsClampedToBlockSize() throws Exception {
+    ReadBlockResult result = readBlock(FOUR_MIB, FOUR_MIB - 1000, 5000, 0);
+    assertSuccess(result);
+    assertEquals(1, result.getDataResponses().size());
+    assertEquals(FOUR_MIB - 65_536, result.getDataResponses().get(0).getReadBlock().getOffset());
+    assertEquals(65_536, result.getDataResponses().get(0).getReadBlock().getData().size());
+  }
+
+  /**
+   * A client supplied responseDataSize bounds every response but the last, which carries only what is still required.
+   */
+  @Test
+  public void testReadBlockHonoursRequestedResponseDataSize() throws Exception {
+    ReadBlockResult result = readBlock(FOUR_MIB, 0, 300_000, 131_072);
+    assertSuccess(result);
+    assertEquals(3, result.getDataResponses().size());
+    long[] expectedSizes = {131_072, 131_072, 65_536};
+    long[] expectedOffsets = {0, 131_072, 262_144};
+    for (int i = 0; i < expectedSizes.length; i++) {
+      ContainerProtos.ReadBlockResponseProto response = result.getDataResponses().get(i).getReadBlock();
+      assertEquals(expectedOffsets[i], response.getOffset(), "offset of response " + i);
+      assertEquals(expectedSizes[i], response.getData().size(), "size of response " + i);
+    }
+  }
+
+  private void assertSuccess(ReadBlockResult result) {
+    assertNull(result.getResponse(), "ReadBlock should return null on success");
+    assertThat(result.getErrors()).isEmpty();
+    assertThat(result.getDataResponses()).isNotEmpty();
+  }
+
   private void assertOutOfRange(ReadBlockResult result, long offset) {
     assertNull(result.getResponse(),
         "ReadBlock must return null so the dispatcher does not scan the container");
@@ -1202,6 +1274,14 @@ public class TestKeyValueHandler {
    * collecting the streamed responses and errors.
    */
   private ReadBlockResult readBlock(int blockSize, long offset, long length) throws Exception {
+    return readBlock(blockSize, offset, length, 0);
+  }
+
+  /**
+   * Same as {@link #readBlock(int, long, long)}, but with an explicit {@code responseDataSize}; 0 leaves the request
+   * field unset so the server default applies.
+   */
+  private ReadBlockResult readBlock(int blockSize, long offset, long length, int responseDataSize) throws Exception {
     Path testDir = Files.createTempDirectory("testReadBlockOutOfRange");
     RandomAccessFileChannel blockFile = null;
     try {
@@ -1230,16 +1310,20 @@ public class TestKeyValueHandler {
       kvHandler.getChunkManager().writeChunk(container, blockID, chunkInfo, data,
           DispatcherContext.getHandleWriteChunk());
 
+      ContainerProtos.ReadBlockRequestProto.Builder readBlockBuilder =
+          ContainerProtos.ReadBlockRequestProto.newBuilder()
+              .setBlockID(blockID.getDatanodeBlockIDProtobuf())
+              .setOffset(offset)
+              .setLength(length);
+      if (responseDataSize > 0) {
+        readBlockBuilder.setResponseDataSize(responseDataSize);
+      }
       ContainerCommandRequestProto readBlockRequest =
           ContainerCommandRequestProto.newBuilder()
               .setCmdType(ContainerProtos.Type.ReadBlock)
               .setContainerID(containerID)
               .setDatanodeUuid(DATANODE_UUID)
-              .setReadBlock(ContainerProtos.ReadBlockRequestProto.newBuilder()
-                  .setBlockID(blockID.getDatanodeBlockIDProtobuf())
-                  .setOffset(offset)
-                  .setLength(length)
-                  .build())
+              .setReadBlock(readBlockBuilder.build())
               .build();
 
       ReadBlockResult result = new ReadBlockResult(blockID);

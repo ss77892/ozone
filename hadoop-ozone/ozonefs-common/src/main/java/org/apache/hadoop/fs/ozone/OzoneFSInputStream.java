@@ -27,10 +27,10 @@ import org.apache.hadoop.fs.ByteBufferReadable;
 import org.apache.hadoop.fs.CanUnbuffer;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.FileSystem.Statistics;
+import org.apache.hadoop.fs.PositionedReadable;
 import org.apache.hadoop.fs.Seekable;
 import org.apache.hadoop.hdds.annotation.InterfaceAudience;
 import org.apache.hadoop.hdds.annotation.InterfaceStability;
-import org.apache.hadoop.hdds.scm.storage.ExtendedInputStream;
 import org.apache.hadoop.hdds.tracing.TracingUtil;
 
 /**
@@ -158,6 +158,13 @@ public class OzoneFSInputStream extends FSInputStream
   }
 
   /**
+   * The wrapped stream, so that subclasses can inspect its capabilities.
+   */
+  protected InputStream getWrappedStream() {
+    return inputStream;
+  }
+
+  /**
    * @param buf the ByteBuffer to receive the results of the read operation.
    * @param position offset
    * @return the number of bytes read, possibly zero, or -1 if
@@ -169,29 +176,32 @@ public class OzoneFSInputStream extends FSInputStream
     if (!buf.hasRemaining()) {
       return 0;
     }
-    if (inputStream instanceof ExtendedInputStream) {
-      final int remainingBeforeRead = buf.remaining();
-      try {
-        if (((ExtendedInputStream) inputStream).readFully(position, buf)) {
-          return remainingBeforeRead - buf.remaining();
+    if (inputStream instanceof ByteBufferPositionedReadable) {
+      try (TracingUtil.TraceCloseable ignored =
+          TracingUtil.createActivatedSpan("OzoneFSInputStream.read(long, ByteBuffer)")) {
+        int bytesRead = ((ByteBufferPositionedReadable) inputStream).read(position, buf);
+        if (statistics != null && bytesRead > 0) {
+          statistics.incrementBytesRead(bytesRead);
         }
-      } catch (EOFException e) {
-        return -1;
+        return bytesRead;
       }
     }
-
-    long oldPos = this.getPos();
-    int bytesRead;
-    try {
-      ((Seekable) inputStream).seek(position);
-      bytesRead = ((ByteBufferReadable) inputStream).read(buf);
-    } catch (EOFException e) {
-      // Either position is negative or it has reached EOF
-      return -1;
-    } finally {
-      ((Seekable) inputStream).seek(oldPos);
+    // The wrapped stream cannot read at a position without moving its cursor: the seek/read/seek-back
+    // compound must not interleave with other users of the cursor.
+    synchronized (this) {
+      long oldPos = this.getPos();
+      int bytesRead;
+      try {
+        ((Seekable) inputStream).seek(position);
+        bytesRead = ((ByteBufferReadable) inputStream).read(buf);
+      } catch (EOFException e) {
+        // Either position is negative or it has reached EOF
+        return -1;
+      } finally {
+        ((Seekable) inputStream).seek(oldPos);
+      }
+      return bytesRead;
     }
-    return bytesRead;
   }
 
   /**
@@ -202,6 +212,17 @@ public class OzoneFSInputStream extends FSInputStream
    */
   @Override
   public void readFully(long position, ByteBuffer buf) throws IOException {
+    if (inputStream instanceof ByteBufferPositionedReadable) {
+      try (TracingUtil.TraceCloseable ignored =
+          TracingUtil.createActivatedSpan("OzoneFSInputStream.readFully(long, ByteBuffer)")) {
+        int remaining = buf.remaining();
+        ((ByteBufferPositionedReadable) inputStream).readFully(position, buf);
+        if (statistics != null && remaining > 0) {
+          statistics.incrementBytesRead(remaining);
+        }
+      }
+      return;
+    }
     int bytesRead;
     for (int readCount = 0; buf.hasRemaining(); readCount += bytesRead) {
       bytesRead = this.read(position + (long)readCount, buf);
@@ -210,5 +231,77 @@ public class OzoneFSInputStream extends FSInputStream
         throw new EOFException("End of file reached before reading fully.");
       }
     }
+  }
+
+  /**
+   * @param position offset to read from
+   * @param b the buffer to receive the results of the read operation
+   * @param off the start offset in {@code b}
+   * @param len the maximum number of bytes to read
+   * @return the number of bytes read, possibly zero, or -1 if
+   *         reach end-of-stream
+   * @throws IOException if there is some error performing the read
+   */
+  @Override
+  public int read(long position, byte[] b, int off, int len) throws IOException {
+    if (inputStream instanceof PositionedReadable) {
+      try (TracingUtil.TraceCloseable ignored =
+          TracingUtil.createActivatedSpan("OzoneFSInputStream.read(long, byte[], int, int)")) {
+        TracingUtil.getActiveSpan().setAttribute("offset", off)
+            .setAttribute("length", len);
+        int bytesRead = ((PositionedReadable) inputStream).read(position, b, off, len);
+        if (statistics != null && bytesRead > 0) {
+          statistics.incrementBytesRead(bytesRead);
+        }
+        return bytesRead;
+      }
+    }
+    return super.read(position, b, off, len);
+  }
+
+  /**
+   * @param position offset to read from
+   * @param b the buffer to receive the results of the read operation
+   * @param off the start offset in {@code b}
+   * @param len the number of bytes to read
+   * @throws IOException if there is some error performing the read
+   * @throws EOFException if end of file reached before reading fully
+   */
+  @Override
+  public void readFully(long position, byte[] b, int off, int len) throws IOException {
+    if (inputStream instanceof PositionedReadable) {
+      try (TracingUtil.TraceCloseable ignored =
+          TracingUtil.createActivatedSpan("OzoneFSInputStream.readFully(long, byte[], int, int)")) {
+        TracingUtil.getActiveSpan().setAttribute("offset", off)
+            .setAttribute("length", len);
+        ((PositionedReadable) inputStream).readFully(position, b, off, len);
+        if (statistics != null && len > 0) {
+          statistics.incrementBytesRead(len);
+        }
+      }
+      return;
+    }
+    super.readFully(position, b, off, len);
+  }
+
+  /**
+   * @param position offset to read from
+   * @param b the buffer to fill with the results of the read operation
+   * @throws IOException if there is some error performing the read
+   * @throws EOFException if end of file reached before reading fully
+   */
+  @Override
+  public void readFully(long position, byte[] b) throws IOException {
+    if (inputStream instanceof PositionedReadable) {
+      try (TracingUtil.TraceCloseable ignored =
+          TracingUtil.createActivatedSpan("OzoneFSInputStream.readFully(long, byte[])")) {
+        ((PositionedReadable) inputStream).readFully(position, b);
+        if (statistics != null && b.length > 0) {
+          statistics.incrementBytesRead(b.length);
+        }
+      }
+      return;
+    }
+    super.readFully(position, b);
   }
 }

@@ -61,15 +61,18 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import javax.xml.bind.DatatypeConverter;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.hadoop.crypto.key.KeyProvider;
 import org.apache.hadoop.crypto.key.kms.KMSClientProvider;
 import org.apache.hadoop.crypto.key.kms.LoadBalancingKMSClientProvider;
 import org.apache.hadoop.crypto.key.kms.server.MiniKMS;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.HddsConfigKeys;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationFactor;
@@ -139,6 +142,9 @@ class TestOzoneAtRestEncryption {
   private static final int BLOCK_SIZE = 64 * 1024; // 64KB
   private static final int CHUNK_SIZE = 16 * 1024; // 16KB
   private static final int DEFAULT_CRYPTO_BUFFER_SIZE = 8 * 1024; // 8KB
+  // Size of the key written through the FileSystem. It is kept below the Crypto buffer size, as
+  // verifyKeyData() reads the whole key with a single read().
+  private static final int FS_KEY_SIZE = 6 * 1024; // 6KB
   // (this is the default Crypto Buffer size as determined by the config
   // hadoop.security.crypto.buffer.size)
   private static MessageDigest eTagProvider;
@@ -323,7 +329,8 @@ class TestOzoneAtRestEncryption {
     }
     Instant testStartTime = getTestStartTime();
     String keyName = UUID.randomUUID().toString();
-    String value = "sample value";
+    // A few KB of data, so that there is room for positioned reads at different offsets.
+    String value = RandomStringUtils.secure().nextAlphanumeric(FS_KEY_SIZE);
 
     final String dir = OZONE_ROOT + bucket.getVolumeName()
         + OZONE_URI_DELIMITER + bucket.getName();
@@ -332,8 +339,53 @@ class TestOzoneAtRestEncryption {
       try (FSDataOutputStream out = fs.create(file, true)) {
         out.write(value.getBytes(StandardCharsets.UTF_8));
       }
+      verifyFileSystemPositionedReads(fs, file,
+          value.getBytes(StandardCharsets.UTF_8));
     }
     verifyKeyData(bucket, keyName, value, testStartTime);
+  }
+
+  /**
+   * Positioned reads of a single part encrypted key opened through the FileSystem. The
+   * CryptoInputStream wrapping the KeyInputStream reads at a position without moving its cursor, and
+   * the capability is consulted through it.
+   */
+  private static void verifyFileSystemPositionedReads(FileSystem fs, Path file,
+      byte[] expected) throws Exception {
+    // Read at the start, at an unaligned offset in the middle and near the end of the key.
+    final int[] positions = {0, expected.length / 3 + 7, expected.length - 137};
+    try (FSDataInputStream in = fs.open(file)) {
+      assertTrue(in.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+
+      // Move the cursor away from the read positions, so that a positioned read moving it is noticed.
+      in.seek(expected.length / 2);
+      final long posBeforeReads = in.getPos();
+
+      for (int position : positions) {
+        final int length = Math.min(1024, expected.length - position);
+        final byte[] expectedData = Arrays.copyOfRange(expected, position, position + length);
+
+        final ByteBuffer buffer = ByteBuffer.allocate(length);
+        while (buffer.hasRemaining()) {
+          final int bytesRead = in.read(position + buffer.position(), buffer);
+          assertThat(bytesRead).isGreaterThan(0);
+        }
+        assertArrayEquals(expectedData, buffer.array(),
+            "read(long, ByteBuffer) at position " + position);
+        assertEquals(posBeforeReads, in.getPos());
+
+        final byte[] readData = new byte[length];
+        int done = 0;
+        while (done < length) {
+          final int bytesRead = in.read(position + done, readData, done, length - done);
+          assertThat(bytesRead).isGreaterThan(0);
+          done += bytesRead;
+        }
+        assertArrayEquals(expectedData, readData,
+            "read(long, byte[], int, int) at position " + position);
+        assertEquals(posBeforeReads, in.getPos());
+      }
+    }
   }
 
   static void verifyKeyData(OzoneBucket bucket, String keyName, String value,
@@ -709,6 +761,25 @@ class TestOzoneAtRestEncryption {
           assertEquals(readDataLen, actualReadLen);
         }
       }
+
+      // Positioned read of a range straddling the boundary of the first part. It does not move the
+      // cursor of the key stream, but the encrypted parts serve it by moving and restoring theirs,
+      // so the key stream does not offer the capability.
+      assertFalse(inputStream.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+
+      final int preadPosition =
+          partsData.get(0).length - DEFAULT_CRYPTO_BUFFER_SIZE / 2;
+      final int preadLength =
+          Math.min(DEFAULT_CRYPTO_BUFFER_SIZE, keySize - preadPosition);
+      final long posBeforePread = inputStream.getPos();
+      final ByteBuffer preadBuffer = ByteBuffer.allocate(preadLength);
+      while (preadBuffer.hasRemaining()) {
+        final int preadBytesRead =
+            inputStream.read(preadPosition + preadBuffer.position(), preadBuffer);
+        assertThat(preadBytesRead).isGreaterThan(0);
+      }
+      assertReadContent(inputData, preadBuffer.array(), preadPosition);
+      assertEquals(posBeforePread, inputStream.getPos());
     }
   }
 

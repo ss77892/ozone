@@ -19,15 +19,24 @@ package org.apache.hadoop.fs.ozone;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -40,6 +49,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CipherSuite;
 import org.apache.hadoop.crypto.CryptoCodec;
 import org.apache.hadoop.crypto.CryptoInputStream;
+import org.apache.hadoop.crypto.CryptoOutputStream;
 import org.apache.hadoop.crypto.Decryptor;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.StreamCapabilities;
@@ -162,6 +172,188 @@ public class TestOzoneFSInputStream {
     } finally {
       cis.close();
     }
+  }
+
+  @Test
+  public void positionedReadDelegatesToKeyInputStream() throws IOException {
+    final byte[] source = RandomUtils.secure().randomBytes(64);
+    final KeyInputStream keyInputStream = mockKeyInputStream(source);
+    final FileSystem.Statistics statistics = new FileSystem.Statistics("test");
+
+    try (OzoneFSInputStream subject =
+        new OzoneFSInputStream(keyInputStream, statistics)) {
+      final ByteBuffer buf = ByteBuffer.allocate(10);
+      assertEquals(10, subject.read(5, buf));
+      assertArrayEquals(Arrays.copyOfRange(source, 5, 15), buf.array());
+      assertEquals(10, statistics.getBytesRead());
+
+      final byte[] bytes = new byte[10];
+      assertEquals(10, subject.read(20, bytes, 0, 10));
+      assertArrayEquals(Arrays.copyOfRange(source, 20, 30), bytes);
+      assertEquals(20, statistics.getBytesRead());
+
+      // Empty buffer, negative position and past-EOF position keep their semantics
+      assertEquals(0, subject.read(5, ByteBuffer.allocate(0)));
+      assertEquals(-1, subject.read(-1, ByteBuffer.allocate(10)));
+      assertEquals(-1, subject.read(source.length, ByteBuffer.allocate(10)));
+      assertEquals(20, statistics.getBytesRead());
+    }
+
+    verify(keyInputStream, never()).seek(anyLong());
+  }
+
+  @Test
+  public void positionedReadFullyDelegatesToKeyInputStream() throws IOException {
+    final byte[] source = RandomUtils.secure().randomBytes(64);
+    final KeyInputStream keyInputStream = mockKeyInputStream(source);
+    final FileSystem.Statistics statistics = new FileSystem.Statistics("test");
+
+    try (OzoneFSInputStream subject =
+        new OzoneFSInputStream(keyInputStream, statistics)) {
+      final ByteBuffer buf = ByteBuffer.allocate(10);
+      subject.readFully(5, buf);
+      assertFalse(buf.hasRemaining());
+      assertArrayEquals(Arrays.copyOfRange(source, 5, 15), buf.array());
+      assertEquals(10, statistics.getBytesRead());
+
+      final byte[] bytes = new byte[10];
+      subject.readFully(20, bytes, 0, 10);
+      assertArrayEquals(Arrays.copyOfRange(source, 20, 30), bytes);
+      assertEquals(20, statistics.getBytesRead());
+
+      final byte[] all = new byte[8];
+      subject.readFully(30, all);
+      assertArrayEquals(Arrays.copyOfRange(source, 30, 38), all);
+      assertEquals(28, statistics.getBytesRead());
+
+      // A range which cannot be filled fails, as required by the contract
+      assertThrows(EOFException.class,
+          () -> subject.readFully(source.length - 1, ByteBuffer.allocate(10)));
+      assertThrows(EOFException.class,
+          () -> subject.readFully(source.length - 1, new byte[10], 0, 10));
+    }
+
+    verify(keyInputStream, never()).seek(anyLong());
+  }
+
+  @Test
+  public void positionedReadThroughCryptoStream()
+      throws IOException, GeneralSecurityException {
+    final byte[] plainText = RandomUtils.secure().randomBytes(1024);
+    final byte[] key = RandomUtils.secure().randomBytes(16);
+    final byte[] iv = RandomUtils.secure().randomBytes(16);
+    final CryptoCodec codec = CryptoCodec.getInstance(new Configuration());
+    final byte[] cipherText = encrypt(plainText, codec, key, iv);
+
+    final KeyInputStream keyInputStream = mockKeyInputStream(cipherText);
+    final FileSystem.Statistics statistics = new FileSystem.Statistics("test");
+
+    try (CryptoInputStream cis =
+             new CryptoInputStream(keyInputStream, codec, key, iv);
+         OzoneFSInputStream subject = new OzoneFSInputStream(cis, statistics)) {
+      final ByteBuffer buf = ByteBuffer.allocate(100);
+      assertEquals(100, subject.read(200, buf));
+      assertArrayEquals(Arrays.copyOfRange(plainText, 200, 300), buf.array());
+      assertEquals(100, statistics.getBytesRead());
+
+      final byte[] bytes = new byte[100];
+      assertEquals(100, subject.read(300, bytes, 0, 100));
+      assertArrayEquals(Arrays.copyOfRange(plainText, 300, 400), bytes);
+      assertEquals(200, statistics.getBytesRead());
+
+      final ByteBuffer fully = ByteBuffer.allocate(100);
+      subject.readFully(400, fully);
+      assertFalse(fully.hasRemaining());
+      assertArrayEquals(Arrays.copyOfRange(plainText, 400, 500), fully.array());
+
+      final byte[] fullyBytes = new byte[100];
+      subject.readFully(500, fullyBytes);
+      assertArrayEquals(Arrays.copyOfRange(plainText, 500, 600), fullyBytes);
+    }
+
+    verify(keyInputStream, never()).seek(anyLong());
+  }
+
+  @Test
+  public void testStreamCapabilityPreadByteBuffer() throws IOException {
+    final KeyInputStream preadCapable = mockKeyInputStream(new byte[0]);
+    when(preadCapable.hasCapability(anyString())).thenReturn(true);
+    assertCapabilities(preadCapable, true);
+
+    final KeyInputStream notPreadCapable = mockKeyInputStream(new byte[0]);
+    when(notPreadCapable.hasCapability(anyString())).thenReturn(false);
+    assertCapabilities(notPreadCapable, false);
+
+    // A stream which does not expose its capabilities cannot do a positioned read without moving the cursor
+    assertCapabilities(emptyStream(), false);
+  }
+
+  private static void assertCapabilities(InputStream wrapped,
+      boolean expectedPread) throws IOException {
+    try (CapableOzoneFSInputStream subject = new CapableOzoneFSInputStream(
+        wrapped, new FileSystem.Statistics("test"))) {
+      assertTrue(subject.hasCapability(StreamCapabilities.READBYTEBUFFER));
+      assertTrue(subject.hasCapability(StreamCapabilities.UNBUFFER));
+      assertEquals(expectedPread,
+          subject.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+    }
+  }
+
+  private static byte[] encrypt(byte[] plainText, CryptoCodec codec,
+      byte[] key, byte[] iv) throws IOException, GeneralSecurityException {
+    final ByteArrayOutputStream out = new ByteArrayOutputStream();
+    try (CryptoOutputStream cos = new CryptoOutputStream(out, codec, key, iv)) {
+      cos.write(plainText);
+    }
+    return out.toByteArray();
+  }
+
+  /**
+   * A KeyInputStream which serves {@code source} from any position without ever moving its cursor.
+   */
+  private static KeyInputStream mockKeyInputStream(byte[] source)
+      throws IOException {
+    final KeyInputStream stream = mock(KeyInputStream.class);
+    when(stream.read(anyLong(), any(ByteBuffer.class))).thenAnswer(
+        invocation -> copyFrom(source, invocation.getArgument(0),
+            invocation.getArgument(1)));
+    when(stream.read(anyLong(), any(byte[].class), anyInt(), anyInt()))
+        .thenAnswer(invocation -> copyFrom(source, invocation.getArgument(0),
+            ByteBuffer.wrap(invocation.getArgument(1),
+                invocation.getArgument(2), invocation.getArgument(3))));
+    doAnswer(invocation -> fillFrom(source, invocation.getArgument(0),
+        invocation.getArgument(1)))
+        .when(stream).readFully(anyLong(), any(ByteBuffer.class));
+    doAnswer(invocation -> fillFrom(source, invocation.getArgument(0),
+        ByteBuffer.wrap(invocation.getArgument(1), invocation.getArgument(2),
+            invocation.getArgument(3))))
+        .when(stream).readFully(anyLong(), any(byte[].class), anyInt(),
+            anyInt());
+    doAnswer(invocation -> fillFrom(source, invocation.getArgument(0),
+        ByteBuffer.wrap(invocation.getArgument(1))))
+        .when(stream).readFully(anyLong(), any(byte[].class));
+    return stream;
+  }
+
+  private static int copyFrom(byte[] source, long position, ByteBuffer dst) {
+    if (!dst.hasRemaining()) {
+      return 0;
+    }
+    if (position < 0 || position >= source.length) {
+      return -1;
+    }
+    final int len = Math.min(dst.remaining(), source.length - (int) position);
+    dst.put(source, (int) position, len);
+    return len;
+  }
+
+  private static Void fillFrom(byte[] source, long position, ByteBuffer dst)
+      throws EOFException {
+    if (position < 0 || position + dst.remaining() > source.length) {
+      throw new EOFException("End of file reached before reading fully.");
+    }
+    copyFrom(source, position, dst);
+    return null;
   }
 
   private static OzoneFSInputStream createTestSubject(InputStream input) {

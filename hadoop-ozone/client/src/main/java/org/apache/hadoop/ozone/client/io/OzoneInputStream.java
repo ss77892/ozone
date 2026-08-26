@@ -20,16 +20,19 @@ package org.apache.hadoop.ozone.client.io;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import org.apache.hadoop.fs.ByteBufferPositionedReadable;
 import org.apache.hadoop.fs.ByteBufferReadable;
 import org.apache.hadoop.fs.CanUnbuffer;
+import org.apache.hadoop.fs.PositionedReadable;
 import org.apache.hadoop.fs.Seekable;
+import org.apache.hadoop.fs.StreamCapabilities;
 
 /**
  * OzoneInputStream is used to read data from Ozone.
  * It uses {@link KeyInputStream} for reading the data.
  */
 public class OzoneInputStream extends InputStream implements CanUnbuffer,
-    ByteBufferReadable, Seekable {
+    ByteBufferReadable, Seekable, PositionedReadable, ByteBufferPositionedReadable, StreamCapabilities {
 
   private final InputStream inputStream;
 
@@ -120,5 +123,56 @@ public class OzoneInputStream extends InputStream implements CanUnbuffer,
       throw new UnsupportedOperationException("Seek is not supported on the " +
           "underlying inputStream");
     }
+  }
+
+  @Override
+  public int read(long position, ByteBuffer buf) throws IOException {
+    if (inputStream instanceof ByteBufferPositionedReadable) {
+      return ((ByteBufferPositionedReadable) inputStream).read(position, buf);
+    } else {
+      throw new UnsupportedOperationException("Positioned read with ByteBuffer is not supported by " +
+          inputStream.getClass().getName());
+    }
+  }
+
+  @Override
+  public void readFully(long position, ByteBuffer buf) throws IOException {
+    if (inputStream instanceof ByteBufferPositionedReadable) {
+      ((ByteBufferPositionedReadable) inputStream).readFully(position, buf);
+    } else {
+      throw new UnsupportedOperationException("Positioned read with ByteBuffer is not supported by " +
+          inputStream.getClass().getName());
+    }
+  }
+
+  @Override
+  public int read(long position, byte[] b, int off, int len) throws IOException {
+    if (inputStream instanceof PositionedReadable) {
+      return ((PositionedReadable) inputStream).read(position, b, off, len);
+    } else {
+      throw new UnsupportedOperationException("Positioned read is not supported by " +
+          inputStream.getClass().getName());
+    }
+  }
+
+  @Override
+  public void readFully(long position, byte[] b, int off, int len) throws IOException {
+    if (inputStream instanceof PositionedReadable) {
+      ((PositionedReadable) inputStream).readFully(position, b, off, len);
+    } else {
+      throw new UnsupportedOperationException("Positioned read is not supported by " +
+          inputStream.getClass().getName());
+    }
+  }
+
+  @Override
+  public void readFully(long position, byte[] b) throws IOException {
+    readFully(position, b, 0, b.length);
+  }
+
+  @Override
+  public boolean hasCapability(String capability) {
+    return inputStream instanceof StreamCapabilities &&
+        ((StreamCapabilities) inputStream).hasCapability(capability);
   }
 }

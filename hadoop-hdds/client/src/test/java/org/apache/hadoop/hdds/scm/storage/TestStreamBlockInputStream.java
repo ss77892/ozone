@@ -21,7 +21,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -33,10 +38,24 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -898,5 +917,402 @@ public class TestStreamBlockInputStream {
                 .build())
             .build())
         .build();
+  }
+
+  // ------------------------------------------------------------------------------------------------------
+  // Positioned reads: read(long, ByteBuffer) runs on its own one-shot streaming read.
+  // ------------------------------------------------------------------------------------------------------
+
+  /**
+   * A pread asks for exactly the requested range: one ReadBlock request with offset == the pread offset and
+   * length clamped to the end of the block, never inflated by the pre-read size.
+   */
+  @Test
+  public void testPreadIssuesSingleExactRequest() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setStreamReadPreReadSize(64L << 20);
+    byte[] data = sequentialBytes(32);
+    RecordingStreamClient client = new RecordingStreamClient(
+        Collections.singletonList(MockDatanodeDetails.randomDatanodeDetails()),
+        (reader, request, datanode) -> serveRange(reader, request, data));
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 30L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+
+      assertPread(sbis, data, 8, 10);
+      assertEquals(1, client.requests.size());
+      assertEquals(8, client.requests.get(0).getReadBlock().getOffset());
+      assertEquals(10, client.requests.get(0).getReadBlock().getLength());
+
+      // A pread which runs off the end of the block is clamped to the remaining bytes.
+      ByteBuffer tail = ByteBuffer.allocate(16);
+      assertEquals(8, sbis.read(24, tail));
+      assertArrayEquals(Arrays.copyOfRange(data, 24, 32), Arrays.copyOf(tail.array(), 8));
+      assertEquals(2, client.requests.size());
+      assertEquals(24, client.requests.get(1).getReadBlock().getOffset());
+      assertEquals(8, client.requests.get(1).getReadBlock().getLength());
+
+      assertEquals(0, sbis.getPos());
+    }
+  }
+
+  @Test
+  public void testPreadHalfClosesOnceOnSuccess() throws Exception {
+    assertPreadHalfClosesExactlyOnce(newStreamReadConfig(), sequentialBytes(8),
+        (reader, request, datanode) -> serveRange(reader, request, sequentialBytes(8)), true);
+  }
+
+  @Test
+  public void testPreadHalfClosesOnceOnChecksumFailure() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setChecksumVerify(true);
+    clientConfig.setMaxReadRetryCount(0);
+    byte[] data = sequentialBytes(8);
+    assertPreadHalfClosesExactlyOnce(clientConfig, data,
+        (reader, request, datanode) -> reader.onNext(buildCorruptResponseProto(data, 0)), false);
+  }
+
+  @Test
+  public void testPreadHalfClosesOnceOnErrorResponse() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setMaxReadRetryCount(0);
+    assertPreadHalfClosesExactlyOnce(clientConfig, sequentialBytes(8),
+        (reader, request, datanode) -> reader.onNext(ContainerCommandResponseProto.newBuilder()
+            .setCmdType(Type.ReadBlock)
+            .setResult(ContainerProtos.Result.CONTAINER_NOT_FOUND)
+            .setMessage("Container not found")
+            .build()), false);
+  }
+
+  @Test
+  public void testPreadHalfClosesOnceOnTimeout() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setMaxReadRetryCount(0);
+    clientConfig.setStreamReadTimeout(Duration.ofMillis(200));
+    assertPreadHalfClosesExactlyOnce(clientConfig, sequentialBytes(8),
+        (reader, request, datanode) -> { }, false);
+  }
+
+  /**
+   * Preads issued before, between and after sequential reads leave the cursor, the sequential reader and its
+   * request stream untouched, and every byte they return is correct.
+   */
+  @Test
+  public void testPreadDoesNotDisturbSequentialReads() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    byte[] data = sequentialBytes(64);
+    RecordingStreamClient client = new RecordingStreamClient(
+        Collections.singletonList(MockDatanodeDetails.randomDatanodeDetails()),
+        (reader, request, datanode) -> serveRange(reader, request, data));
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 31L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+
+      // Before any sequential read: no cursor, no sequential reader.
+      assertPread(sbis, data, 40, 8);
+      assertEquals(0, sbis.getPos());
+      assertNull(sequentialReader(sbis));
+
+      byte[] head = new byte[16];
+      assertEquals(16, sbis.read(head, 0, 16));
+      assertArrayEquals(Arrays.copyOfRange(data, 0, 16), head);
+      assertEquals(16, sbis.getPos());
+
+      final StreamingReaderSpi sequentialReader = sequentialReader(sbis);
+      assertNotNull(sequentialReader);
+      // TestStreamReadDatanodeFailover reaches the serving datanode through this exact declared method.
+      assertNotNull(sequentialReader.getClass().getDeclaredMethod("getResponse"));
+      final int sequentialRequests = client.requests.size();
+
+      // Between sequential reads.
+      assertPread(sbis, data, 0, 8);
+      assertEquals(16, sbis.getPos());
+      assertSame(sequentialReader, sequentialReader(sbis));
+
+      sbis.seek(32);
+      assertPread(sbis, data, 20, 12);
+      assertEquals(32, sbis.getPos());
+      assertSame(sequentialReader, sequentialReader(sbis));
+
+      byte[] tail = new byte[16];
+      assertEquals(16, sbis.read(tail, 0, 16));
+      assertArrayEquals(Arrays.copyOfRange(data, 32, 48), tail);
+      assertEquals(48, sbis.getPos());
+
+      // The preads sent their own requests, the sequential reader only its own.
+      assertEquals(sequentialRequests + 3, client.requests.size());
+      verify(client.observerOf(sequentialReader), never()).onCompleted();
+
+      sbis.unbuffer();
+      assertPread(sbis, data, 56, 8);
+      assertEquals(48, sbis.getPos());
+      // unbuffer(), not the preads, half-closed the sequential stream.
+      verify(client.observerOf(sequentialReader), times(1)).onCompleted();
+    }
+  }
+
+  /**
+   * Concurrent preads each get their own streaming read: all of them reach initStreamRead before any response
+   * is delivered, and each one returns its own range.
+   */
+  @Test
+  public void testConcurrentPreadsUseIndependentStreams() throws Exception {
+    final int threads = 8;
+    final int chunk = 16;
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    byte[] data = sequentialBytes(threads * chunk);
+    CountDownLatch started = new CountDownLatch(threads);
+    CountDownLatch release = new CountDownLatch(1);
+    RecordingStreamClient client = new RecordingStreamClient(
+        Collections.singletonList(MockDatanodeDetails.randomDatanodeDetails()),
+        (reader, request, datanode) -> {
+          started.countDown();
+          assertTrue(release.await(30, TimeUnit.SECONDS), "responses should be released");
+          serveRange(reader, request, data);
+        });
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 32L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+
+      List<Future<byte[]>> results = new ArrayList<>();
+      for (int i = 0; i < threads; i++) {
+        final long offset = (long) i * chunk;
+        results.add(pool.submit(() -> {
+          ByteBuffer buf = ByteBuffer.allocate(chunk);
+          assertEquals(chunk, sbis.read(offset, buf));
+          return buf.array();
+        }));
+      }
+
+      assertTrue(started.await(30, TimeUnit.SECONDS), "every pread should reach its own streaming read");
+      assertEquals(threads, client.readers.size(), "one reader per pread");
+      assertEquals(threads, new HashSet<>(client.readers).size(), "readers must be distinct");
+      release.countDown();
+
+      for (int i = 0; i < threads; i++) {
+        assertArrayEquals(Arrays.copyOfRange(data, i * chunk, (i + 1) * chunk),
+            results.get(i).get(30, TimeUnit.SECONDS));
+      }
+      assertEquals(0, sbis.getPos());
+    } finally {
+      pool.shutdownNow();
+    }
+    verify(client.client, times(threads)).completeStreamRead();
+  }
+
+  /**
+   * A connectivity failure excludes the failing datanode from the retry, refreshes the block location once and
+   * completes on the next datanode without disturbing the sequential retry counter.
+   */
+  @Test
+  public void testPreadExcludesFailedDatanodeAndRetries() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setReadRetryInterval(0);
+    byte[] data = sequentialBytes(16);
+    DatanodeDetails first = MockDatanodeDetails.randomDatanodeDetails();
+    DatanodeDetails second = MockDatanodeDetails.randomDatanodeDetails();
+    RecordingStreamClient client = new RecordingStreamClient(Arrays.asList(first, second),
+        (reader, request, datanode) -> {
+          if (datanode.getID().equals(first.getID())) {
+            reader.onError(new StatusRuntimeException(Status.UNAVAILABLE));
+          } else {
+            serveRange(reader, request, data);
+          }
+        });
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+    AtomicInteger refreshes = new AtomicInteger();
+    Function<BlockID, BlockLocationInfo> refreshFunction = b -> {
+      refreshes.incrementAndGet();
+      return null;
+    };
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 33L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        refreshFunction, clientConfig)) {
+
+      assertPread(sbis, data, 0, data.length);
+      assertEquals(1, refreshes.get(), "the block location should be refreshed once");
+      assertEquals(2, client.excludedSets.size());
+      assertThat(client.excludedSets.get(0)).isEmpty();
+      assertThat(client.excludedSets.get(1)).contains(first.getID());
+      assertEquals(0, sequentialRetries(sbis), "a pread must not touch the sequential retry counter");
+
+      // The sequential path still works, on the datanode which is left.
+      byte[] out = new byte[data.length];
+      assertEquals(data.length, sbis.read(out, 0, data.length));
+      assertArrayEquals(data, out);
+      assertEquals(0, sequentialRetries(sbis));
+    }
+  }
+
+  /**
+   * The datanode reports a read beyond the end of the block with a gRPC OUT_OF_RANGE status, which must surface
+   * as EOFException; a pread starting at or after the block length short-circuits to EOF.
+   */
+  @Test
+  public void testPreadOutOfRangeSurfacesEof() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    byte[] data = sequentialBytes(8);
+    RecordingStreamClient client = new RecordingStreamClient(
+        Collections.singletonList(MockDatanodeDetails.randomDatanodeDetails()),
+        (reader, request, datanode) -> reader.onError(Status.OUT_OF_RANGE.asRuntimeException()));
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 34L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+
+      assertThrows(EOFException.class, () -> sbis.readFully(0, ByteBuffer.allocate(4)),
+          "an OUT_OF_RANGE response should surface as EOFException");
+      assertEquals(1, client.readers.size(), "OUT_OF_RANGE must not be retried");
+
+      assertEquals(-1, sbis.read(data.length, ByteBuffer.allocate(4)));
+      assertEquals(-1, sbis.read(data.length + 10L, ByteBuffer.allocate(4)));
+      assertEquals(-1, sbis.read(-1L, ByteBuffer.allocate(4)));
+      assertEquals(0, sbis.read(0, ByteBuffer.allocate(0)));
+      assertEquals(1, client.readers.size(), "out of range preads must not open a stream");
+    }
+  }
+
+  @Test
+  public void testHasPreadByteBufferCapability() throws Exception {
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 35L), 1024L, mockStandalonePipeline(), null, mock(XceiverClientFactory.class),
+        NO_REFRESH, newStreamReadConfig())) {
+      assertTrue(sbis.hasCapability("in:preadbytebuffer"));
+      assertTrue(sbis.hasCapability("in:readbytebuffer"));
+      assertFalse(sbis.hasCapability("in:something-else"));
+    }
+  }
+
+  /**
+   * Runs a single pread against {@code handler} and asserts that its request stream was half-closed and its
+   * streaming permit released exactly once, whether it succeeded or failed.
+   */
+  private void assertPreadHalfClosesExactlyOnce(OzoneClientConfig clientConfig, byte[] data,
+      StreamReadHandler handler, boolean expectSuccess) throws Exception {
+    RecordingStreamClient client = new RecordingStreamClient(
+        Collections.singletonList(MockDatanodeDetails.randomDatanodeDetails()), handler);
+    XceiverClientFactory xceiverClientFactory = mockFactory(client);
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        new BlockID(1L, 36L), data.length, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+      ByteBuffer buf = ByteBuffer.allocate(data.length);
+      if (expectSuccess) {
+        assertEquals(data.length, sbis.read(0, buf));
+        assertArrayEquals(data, buf.array());
+      } else {
+        assertThrows(IOException.class, () -> sbis.read(0, buf));
+      }
+    }
+
+    assertEquals(1, client.observers.size(), "exactly one streaming read per pread");
+    verify(client.observers.get(0), times(1)).onCompleted();
+    verify(client.client, times(1)).completeStreamRead();
+    verify(xceiverClientFactory, times(1)).releaseClientForReadData(client.client, false);
+  }
+
+  private void assertPread(StreamBlockInputStream sbis, byte[] data, int blockOffset, int length)
+      throws IOException {
+    ByteBuffer buf = ByteBuffer.allocate(length);
+    assertEquals(length, sbis.read(blockOffset, buf));
+    assertArrayEquals(Arrays.copyOfRange(data, blockOffset, blockOffset + length), buf.array());
+  }
+
+  private void serveRange(StreamingReaderSpi reader, ContainerCommandRequestProto request, byte[] blockData) {
+    final int offset = Math.toIntExact(request.getReadBlock().getOffset());
+    final int length = Math.toIntExact(request.getReadBlock().getLength());
+    reader.onNext(buildResponseProto(Arrays.copyOfRange(blockData, offset, offset + length), offset));
+  }
+
+  private XceiverClientFactory mockFactory(RecordingStreamClient client) throws IOException {
+    XceiverClientFactory xceiverClientFactory = mock(XceiverClientFactory.class);
+    when(xceiverClientFactory.acquireClientForReadData(any(Pipeline.class))).thenReturn(client.client);
+    return xceiverClientFactory;
+  }
+
+  private static byte[] sequentialBytes(int length) {
+    byte[] data = new byte[length];
+    for (int i = 0; i < length; i++) {
+      data[i] = (byte) i;
+    }
+    return data;
+  }
+
+  /** The sequential reader is read by reflection, as TestStreamReadDatanodeFailover does. */
+  private static StreamingReaderSpi sequentialReader(StreamBlockInputStream sbis) throws Exception {
+    final Field field = StreamBlockInputStream.class.getDeclaredField("streamingReader");
+    field.setAccessible(true);
+    return (StreamingReaderSpi) field.get(sbis);
+  }
+
+  private static int sequentialRetries(StreamBlockInputStream sbis) throws Exception {
+    final Field field = StreamBlockInputStream.class.getDeclaredField("retries");
+    field.setAccessible(true);
+    return field.getInt(sbis);
+  }
+
+  /** Drives the reader when a ReadBlock request reaches the datanode which serves the stream. */
+  @FunctionalInterface
+  private interface StreamReadHandler {
+    void handle(StreamingReaderSpi reader, ContainerCommandRequestProto request, DatanodeDetails datanode)
+        throws Exception;
+  }
+
+  /**
+   * A streaming read client which gives every initStreamRead its own request observer and
+   * StreamingReadResponse, and records the reader, the excluded-datanode snapshot and every request sent.
+   */
+  private static final class RecordingStreamClient {
+    private final XceiverClientGrpc client = mock(XceiverClientGrpc.class);
+    private final List<StreamingReaderSpi> readers = Collections.synchronizedList(new ArrayList<>());
+    private final List<Set<DatanodeID>> excludedSets = Collections.synchronizedList(new ArrayList<>());
+    private final List<ContainerCommandRequestProto> requests = Collections.synchronizedList(new ArrayList<>());
+    private final List<ClientCallStreamObserver<ContainerCommandRequestProto>> observers =
+        Collections.synchronizedList(new ArrayList<>());
+    private final Map<StreamingReaderSpi, ClientCallStreamObserver<ContainerCommandRequestProto>> readerObservers =
+        new ConcurrentHashMap<>();
+    private final Map<StreamingReadResponse, StreamingReaderSpi> readerByResponse = new ConcurrentHashMap<>();
+
+    private RecordingStreamClient(List<DatanodeDetails> datanodes, StreamReadHandler handler) throws Exception {
+      doAnswer(inv -> {
+        final StreamingReaderSpi reader = inv.getArgument(1);
+        final Set<DatanodeID> excluded = inv.getArgument(2);
+        final DatanodeDetails datanode = datanodes.stream()
+            .filter(dn -> !excluded.contains(dn.getID()))
+            .findFirst()
+            .orElseThrow(() -> new IOException("All datanodes are excluded"));
+        final ClientCallStreamObserver<ContainerCommandRequestProto> observer =
+            mock(ClientCallStreamObserver.class);
+        final StreamingReadResponse response = new StreamingReadResponse(datanode, observer);
+        excludedSets.add(new HashSet<>(excluded));
+        observers.add(observer);
+        readers.add(reader);
+        readerObservers.put(reader, observer);
+        readerByResponse.put(response, reader);
+        reader.setStreamingReadResponse(response);
+        return null;
+      }).when(client).initStreamRead(any(BlockID.class), any(), any());
+
+      doAnswer(inv -> {
+        final ContainerCommandRequestProto request = inv.getArgument(0);
+        final StreamingReadResponse response = inv.getArgument(1);
+        requests.add(request);
+        handler.handle(readerByResponse.get(response), request, response.getDatanodeDetails());
+        return null;
+      }).when(client).streamRead(any(), any());
+    }
+
+    private ClientCallStreamObserver<ContainerCommandRequestProto> observerOf(StreamingReaderSpi reader) {
+      return readerObservers.get(reader);
+    }
   }
 }

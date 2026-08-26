@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
@@ -30,6 +31,8 @@ import static org.mockito.Mockito.when;
 
 import java.io.EOFException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicLong;
@@ -283,5 +286,62 @@ public class TestChunkInputStream {
       verify(clientFactory).acquireClientForReadData(newPipeline);
       verify(newToken).encodeToUrlString();
     }
+  }
+
+  /**
+   * A ChunkInputStream seeked to an unaligned position issues a single ReadChunk for the checksum
+   * boundaries covering the requested range and releases its client when closed. This is what
+   * BlockInputStream's positioned read relies on when it reads a chunk through an ephemeral stream.
+   */
+  @Test
+  public void readsAlignedRangeAndReleasesClientOnClose() throws Exception {
+    // GIVEN
+    Pipeline pipeline = MockPipeline.createSingleNodePipeline();
+    AtomicReference<Pipeline> pipelineRef = new AtomicReference<>(pipeline);
+    AtomicReference<Token<?>> tokenRef = new AtomicReference<>(null);
+
+    XceiverClientFactory clientFactory = mock(XceiverClientFactory.class);
+    XceiverClientSpi client = mock(XceiverClientSpi.class);
+    when(clientFactory.acquireClientForReadData(any()))
+        .thenReturn(client);
+    when(client.getPipeline())
+        .thenAnswer(invocation -> pipelineRef.get());
+
+    List<ChunkInfo> readChunkRequests = new ArrayList<>();
+    ArgumentCaptor<ContainerCommandRequestProto> requestCaptor =
+        ArgumentCaptor.forClass(ContainerCommandRequestProto.class);
+    when(client.sendCommand(requestCaptor.capture(), any()))
+        .thenAnswer(invocation -> {
+          ContainerCommandRequestProto request = requestCaptor.getValue();
+          ChunkInfo requested = request.getReadChunk().getChunkData();
+          readChunkRequests.add(requested);
+          ByteBuffer data = ByteBuffer.wrap(Arrays.copyOfRange(chunkData,
+              (int) requested.getOffset(), (int) (requested.getOffset() + requested.getLen())));
+          return getReadChunkResponse(request, ChunkBuffer.wrap(data),
+              ByteStringConversion::safeWrap);
+        });
+
+    ChunkInputStream subject = new ChunkInputStream(chunkInfo, blockID, clientFactory,
+        pipelineRef::get, true, tokenRef::get);
+
+    // WHEN
+    byte[] buffer = new byte[30];
+    try {
+      subject.seek(25);
+      assertEquals(30, subject.read(buffer, 0, 30));
+    } finally {
+      subject.close();
+    }
+
+    // THEN reading 25-54 is served by a single ReadChunk of the covering checksum boundaries 20-59,
+    // and the client is given back to the factory.
+    assertArrayEquals(Arrays.copyOfRange(chunkData, 25, 55), buffer);
+    assertEquals(1, readChunkRequests.size());
+    ChunkInfo requested = readChunkRequests.get(0);
+    assertNotNull(requested);
+    assertEquals(20, requested.getOffset());
+    assertEquals(2 * BYTES_PER_CHECKSUM, requested.getLen());
+    verify(clientFactory).acquireClientForReadData(pipeline);
+    verify(clientFactory).releaseClientForReadData(client, false);
   }
 }

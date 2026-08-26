@@ -17,6 +17,7 @@
 
 package org.apache.hadoop.hdds.scm.storage;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -48,7 +49,7 @@ public class DummyChunkInputStream extends ChunkInputStream {
   }
 
   @Override
-  protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo) {
+  protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo) throws IOException {
     int offset = (int) readChunkInfo.getOffset();
     int remainingToRead = (int) readChunkInfo.getLen();
 

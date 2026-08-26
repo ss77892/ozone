@@ -23,12 +23,14 @@ import java.io.EOFException;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.BlockData;
@@ -47,6 +49,7 @@ import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
 import org.apache.hadoop.hdds.security.token.OzoneBlockTokenIdentifier;
 import org.apache.hadoop.io.retry.RetryPolicy;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,19 +67,19 @@ public class BlockInputStream extends BlockExtendedInputStream {
       ContainerProtocolCalls.toValidatorList((request, response) -> validate(response));
 
   private final BlockID blockID;
-  private long length;
+  private volatile long length;
   private final BlockLocationInfo blockInfo;
   private final AtomicReference<Pipeline> pipelineRef =
       new AtomicReference<>();
   private final AtomicReference<Token<OzoneBlockTokenIdentifier>> tokenRef =
       new AtomicReference<>();
   private final boolean verifyChecksum;
-  private XceiverClientFactory xceiverClientFactory;
+  private volatile XceiverClientFactory xceiverClientFactory;
   private XceiverClientSpi xceiverClientGrpc;
   private XceiverClientShortCircuit xceiverClientShortCircuit;
   private final AtomicBoolean fallbackToGrpc = new AtomicBoolean(false);
   private volatile FileInputStream blockFileInputStream;
-  private boolean initialized = false;
+  private volatile boolean initialized = false;
   // TODO: do we need to change retrypolicy based on exception.
   private final RetryPolicy retryPolicy;
 
@@ -471,6 +474,138 @@ public class BlockInputStream extends BlockExtendedInputStream {
   }
 
   /**
+   * Positioned read which neither moves the cursor of this stream nor holds its lock while the chunks are
+   * read, so it can run concurrently with the other reads on the same stream. Each covering chunk is read
+   * through an ephemeral {@link ChunkInputStream} which is closed as soon as its bytes have been copied,
+   * so none of the sequential read state is touched.
+   *
+   * @param blockOffset the position in the block to read from.
+   * @param dst the buffer to read into.
+   * @return the number of bytes copied into {@code dst}, or -1 if no byte could be read.
+   */
+  @Override
+  public int read(long blockOffset, ByteBuffer dst) throws IOException {
+    if (!dst.hasRemaining()) {
+      return 0;
+    }
+
+    final XceiverClientFactory factory = xceiverClientFactory;
+    if (factory != null && factory.isShortCircuitEnabled()) {
+      // In short-circuit mode the chunks of the block are read through a single FileInputStream shared by
+      // all the LocalChunkInputStreams, so the reads cannot run concurrently. Fall back to the serialized
+      // default which moves the cursor and restores it under the stream lock.
+      return super.read(blockOffset, dst);
+    }
+
+    checkOpen();
+    // initialize() is idempotent and synchronized, so exactly one GetBlock is sent per block irrespective
+    // of the number of positioned reads. After it this positioned read takes no monitor of this stream:
+    // chunkOffsets, blockData and length are assigned in initialize() before the volatile write of
+    // initialized and are read here only after the volatile read, so they need no further synchronization.
+    if (!initialized) {
+      initialize();
+    }
+
+    final long[] offsets = chunkOffsets;
+    final BlockData currentBlockData = blockData;
+    final long blockLength = length;
+    if (offsets == null || currentBlockData == null) {
+      // The block has no chunks.
+      return EOF;
+    }
+    if (blockOffset < 0 || blockOffset >= blockLength) {
+      return EOF;
+    }
+
+    final List<ChunkInfo> chunkInfos = currentBlockData.getChunksList();
+    int index = Arrays.binarySearch(offsets, blockOffset);
+    if (index < 0) {
+      // Binary search returns -insertionPoint - 1 if the element is not present in the array, and the
+      // covering chunk is the one starting just below the position, i.e. insertionPoint - 1.
+      index = -index - 2;
+    }
+
+    long pos = blockOffset;
+    int totalReadLen = 0;
+    while (dst.hasRemaining() && pos < blockLength && index < chunkInfos.size()) {
+      final ChunkInfo chunkInfo = chunkInfos.get(index);
+      final long chunkOffset = pos - offsets[index];
+      final long numBytesToRead = Math.min(
+          Math.min(dst.remaining(), chunkInfo.getLen() - chunkOffset), blockLength - pos);
+      if (numBytesToRead <= 0) {
+        index++;
+        continue;
+      }
+      final int numBytesRead =
+          readChunkAt(chunkInfo, chunkOffset, (int) numBytesToRead, dst);
+      totalReadLen += numBytesRead;
+      pos += numBytesRead;
+      index++;
+    }
+    return totalReadLen == 0 ? EOF : totalReadLen;
+  }
+
+  /**
+   * Read {@code numBytesToRead} bytes starting at {@code chunkOffset} of the given chunk into {@code dst}
+   * through an ephemeral ChunkInputStream, retrying like {@link #readWithStrategy(ByteReaderStrategy)} but
+   * with a retry counter local to this call, so that the state of the sequential read is left untouched.
+   */
+  private int readChunkAt(ChunkInfo chunkInfo, long chunkOffset, int numBytesToRead, ByteBuffer dst)
+      throws IOException {
+    final int startPosition = dst.position();
+    int preadRetries = 0;
+    while (true) {
+      final ChunkInputStream chunkStream = createChunkInputStream(chunkInfo);
+      final int numBytesRead;
+      try {
+        final int oldLimit = dst.limit();
+        try {
+          chunkStream.seek(chunkOffset);
+          dst.limit(startPosition + numBytesToRead);
+          numBytesRead = chunkStream.read(dst);
+        } finally {
+          dst.limit(oldLimit);
+        }
+        // If we get a StorageContainerException or an IOException due to datanodes are not reachable,
+        // refresh to get the latest pipeline info and retry. Otherwise, just retry according to the
+        // retry policy. The ephemeral stream reads the pipeline and the token when it is created, so a
+        // refreshed pipeline is picked up by the next attempt.
+      } catch (SCMSecurityException ex) {
+        throw ex;
+      } catch (StorageContainerException ex) {
+        if (!shouldRetryRead(ex, retryPolicy, ++preadRetries)) {
+          throw ex;
+        }
+        refreshBlockInfo(ex);
+        dst.position(startPosition);
+        continue;
+      } catch (IOException ex) {
+        if (!shouldRetryRead(ex, retryPolicy, ++preadRetries)) {
+          throw ex;
+        }
+        if (isConnectivityIssue(ex)) {
+          refreshBlockInfo(ex);
+        }
+        dst.position(startPosition);
+        continue;
+      } finally {
+        chunkStream.close();
+      }
+
+      if (numBytesRead != numBytesToRead) {
+        // This implies that there is either data loss or corruption in the
+        // chunk entries. Even EOF in the current stream would be covered in
+        // this case.
+        throw new IOException(String.format(
+            "Inconsistent read for chunkName=%s length=%d numBytesToRead= %d " +
+                "numBytesRead=%d", chunkInfo.getChunkName(), chunkInfo.getLen(),
+            numBytesToRead, numBytesRead));
+      }
+      return numBytesRead;
+    }
+  }
+
+  /**
    * Seeks the BlockInputStream to the specified position. If the stream is
    * not initialized, save the seeked position via blockPosition. Otherwise,
    * update the position in 2 steps:
@@ -592,7 +727,7 @@ public class BlockInputStream extends BlockExtendedInputStream {
    *
    * @throws IOException if stream is closed
    */
-  protected synchronized void checkOpen() throws IOException {
+  protected void checkOpen() throws IOException {
     if (xceiverClientFactory == null) {
       throw new IOException("BlockInputStream has been closed.");
     }
@@ -606,6 +741,17 @@ public class BlockInputStream extends BlockExtendedInputStream {
   @Override
   public long getLength() {
     return length;
+  }
+
+  @Override
+  public boolean hasCapability(String capability) {
+    if (StreamCapabilities.PREADBYTEBUFFER.equals(StringUtils.toLowerCase(capability))) {
+      // Positioned reads only avoid moving the cursor when the chunks are read through ephemeral
+      // ChunkInputStreams, which is not possible in short-circuit mode.
+      final XceiverClientFactory factory = xceiverClientFactory;
+      return factory == null || !factory.isShortCircuitEnabled();
+    }
+    return super.hasCapability(capability);
   }
 
   public synchronized int getChunkIndex() {

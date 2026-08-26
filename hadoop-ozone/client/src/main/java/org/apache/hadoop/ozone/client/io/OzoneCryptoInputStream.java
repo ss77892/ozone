@@ -18,11 +18,16 @@
 package org.apache.hadoop.ozone.client.io;
 
 import com.google.common.base.Preconditions;
+import java.io.EOFException;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import org.apache.hadoop.crypto.CryptoCodec;
 import org.apache.hadoop.crypto.CryptoInputStream;
 import org.apache.hadoop.crypto.CryptoStreamUtils;
+import org.apache.hadoop.fs.FSExceptionMessages;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.scm.storage.PartInputStream;
+import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,6 +40,8 @@ public class OzoneCryptoInputStream extends CryptoInputStream
 
   private static final Logger LOG =
       LoggerFactory.getLogger(OzoneCryptoInputStream.class);
+
+  private static final int EOF = -1;
 
   private final long length;
   private final int bufferSize;
@@ -74,7 +81,7 @@ public class OzoneCryptoInputStream extends CryptoInputStream
   }
 
   @Override
-  public int read(byte[] b, int off, int len) throws IOException {
+  public synchronized int read(byte[] b, int off, int len) throws IOException {
     // CryptoInputStream reads hadoop.security.crypto.buffer.size number of
     // bytes (default 8KB) at a time. This needs to be taken into account
     // in calculating the numBytesToRead.
@@ -134,6 +141,116 @@ public class OzoneCryptoInputStream extends CryptoInputStream
       }
     }
     return numBytesRead;
+  }
+
+  /**
+   * {@link CryptoInputStream} does not synchronize its own methods, so every method moving the cursor of
+   * this stream is serialized here on the monitor of this stream. Otherwise a read or a seek could land in
+   * the middle of a positioned read and see (or undo) the cursor move that read does. This one is the
+   * sequential read MultipartInputStream uses for a part, so it races with the positioned read of the
+   * multipart stream, which is intentionally lock-free.
+   */
+  @Override
+  public synchronized int read(ByteBuffer buf) throws IOException {
+    return super.read(buf);
+  }
+
+  @Override
+  public synchronized void seek(long pos) throws IOException {
+    super.seek(pos);
+  }
+
+  @Override
+  public synchronized long getPos() throws IOException {
+    return super.getPos();
+  }
+
+  /**
+   * Positioned read. Decryption can only happen at the Crypto buffer boundaries, so this stream cannot
+   * read at an arbitrary position without moving its cursor. The read is therefore serialized against the
+   * other reads on this stream: the cursor is moved to {@code position}, the data is read through
+   * {@link #read(byte[], int, int)} (which does the Crypto buffer boundary adjustment) and the cursor is
+   * restored before the lock is released.
+   *
+   * @param position the position to read from.
+   * @param dst the buffer to read into.
+   * @return the number of bytes copied into {@code dst}, or -1 if no byte could be read.
+   */
+  @Override
+  public synchronized int read(long position, ByteBuffer dst) throws IOException {
+    if (!dst.hasRemaining()) {
+      return 0;
+    }
+    if (position < 0 || position >= getLength()) {
+      return EOF;
+    }
+
+    final long oldPos = getPos();
+    final int numBytesToRead = (int) Math.min(dst.remaining(), getLength() - position);
+    final byte[] buffer = new byte[Math.min(numBytesToRead, getBufferSize())];
+    Throwable failure = null;
+    try {
+      seek(position);
+      int totalReadLen = 0;
+      while (totalReadLen < numBytesToRead) {
+        // read(byte[], int, int) returns at most one Crypto buffer worth of data per call.
+        final int numBytesRead = read(buffer, 0, Math.min(buffer.length, numBytesToRead - totalReadLen));
+        if (numBytesRead <= 0) {
+          break;
+        }
+        dst.put(buffer, 0, numBytesRead);
+        totalReadLen += numBytesRead;
+      }
+      return totalReadLen == 0 ? EOF : totalReadLen;
+    } catch (Throwable t) {
+      failure = t;
+      throw t;
+    } finally {
+      try {
+        seek(oldPos);
+      } catch (IOException e) {
+        if (failure == null) {
+          throw e;
+        }
+        failure.addSuppressed(e);
+      }
+    }
+  }
+
+  @Override
+  public void readFully(long position, ByteBuffer dst) throws IOException {
+    int done = 0;
+    while (dst.hasRemaining()) {
+      final int numBytesRead = read(position + done, dst);
+      if (numBytesRead == EOF) {
+        throw new EOFException(FSExceptionMessages.EOF_IN_READ_FULLY);
+      }
+      done += numBytesRead;
+    }
+  }
+
+  @Override
+  public int read(long position, byte[] b, int off, int len) throws IOException {
+    return read(position, ByteBuffer.wrap(b, off, len));
+  }
+
+  @Override
+  public void readFully(long position, byte[] b, int off, int len) throws IOException {
+    readFully(position, ByteBuffer.wrap(b, off, len));
+  }
+
+  @Override
+  public void readFully(long position, byte[] b) throws IOException {
+    readFully(position, b, 0, b.length);
+  }
+
+  @Override
+  public boolean hasCapability(String capability) {
+    if (StreamCapabilities.PREADBYTEBUFFER.equals(StringUtils.toLowerCase(capability))) {
+      // The positioned read of this stream moves the cursor and is serialized against the other reads.
+      return false;
+    }
+    return super.hasCapability(capability);
   }
 
   /**

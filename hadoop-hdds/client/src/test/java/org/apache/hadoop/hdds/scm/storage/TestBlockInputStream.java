@@ -20,6 +20,7 @@ package org.apache.hadoop.hdds.scm.storage;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.CONTAINER_NOT_FOUND;
 import static org.apache.hadoop.hdds.scm.storage.TestChunkInputStream.generateRandomData;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -29,6 +30,7 @@ import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -37,15 +39,24 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.RandomUtils;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ContainerBlockID;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -468,5 +479,454 @@ public class TestBlockInputStream {
         Arguments.of(new IOException(new ExecutionException(
             new StatusException(Status.UNAVAILABLE))))
     );
+  }
+
+  /**
+   * Rebuild the chunk list with a checksum stored for every {@code bytesPerChecksum} bytes, so that the
+   * range a positioned read has to align to is smaller than a chunk.
+   */
+  private void createChunkListWithChecksumEvery(int bytesPerChecksum) throws Exception {
+    checksum = new Checksum(ChecksumType.CRC32, bytesPerChecksum);
+    blockSize = 0;
+    createChunkList(5);
+  }
+
+  private byte[] blockDataRange(int from, int to) {
+    return Arrays.copyOfRange(blockData, from, to);
+  }
+
+  private static List<Long> chunkStreamPositions(BlockInputStream stream) {
+    List<Long> positions = new ArrayList<>();
+    for (ChunkInputStream chunkStream : stream.getChunkStreams()) {
+      positions.add(chunkStream.getPos());
+    }
+    return positions;
+  }
+
+  @Test
+  public void testPositionedReadAcrossChunkBoundary() throws Exception {
+    // Checksums are stored for every 20 bytes, so each ReadChunk must cover the checksum boundaries
+    // around the requested range and nothing more.
+    createChunkListWithChecksumEvery(20);
+
+    try (RecordingBlockInputStream subject = createRecordingStream(true)) {
+      ByteBuffer buffer = ByteBuffer.allocate(100);
+      assertEquals(100, subject.read(150, buffer));
+      assertArrayEquals(blockDataRange(150, 250), buffer.array());
+
+      // chunk-1 holds block bytes 100-199, chunk-2 holds 200-299, so exactly two chunks are covered.
+      List<ChunkInfo> requests = subject.getReadChunkRequests();
+      assertEquals(2, requests.size());
+      // 50-99 of chunk-1: aligned down to 40 and up to the end of the covering checksum boundary (100).
+      assertEquals("chunk-1", requests.get(0).getChunkName());
+      assertEquals(40, requests.get(0).getOffset());
+      assertEquals(60, requests.get(0).getLen());
+      // 0-49 of chunk-2: aligned up to the end of the covering checksum boundary (60).
+      assertEquals("chunk-2", requests.get(1).getChunkName());
+      assertEquals(0, requests.get(1).getOffset());
+      assertEquals(60, requests.get(1).getLen());
+    }
+  }
+
+  @Test
+  public void testPositionedReadGetsBlockDataOnce() throws Exception {
+    try (RecordingBlockInputStream subject = createRecordingStream(false)) {
+      for (int i = 0; i < 100; i++) {
+        ByteBuffer buffer = ByteBuffer.allocate(10);
+        assertEquals(10, subject.read(i, buffer));
+        assertArrayEquals(blockDataRange(i, i + 10), buffer.array());
+      }
+      assertEquals(1, subject.getBlockDataCount());
+    }
+  }
+
+  @Test
+  public void testConcurrentPositionedReads() throws Exception {
+    final int threadCount = 8;
+    final int readLen = 50;
+    final CountDownLatch insideReadChunk = new CountDownLatch(threadCount);
+    final CountDownLatch release = new CountDownLatch(1);
+
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+    try (RecordingBlockInputStream subject = createRecordingStream(false, () -> {
+      insideReadChunk.countDown();
+      try {
+        assertTrue(release.await(60, TimeUnit.SECONDS), "readChunk was never released");
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(e);
+      }
+    }, 0)) {
+      subject.initialize();
+
+      List<Future<byte[]>> futures = new ArrayList<>(threadCount);
+      for (int i = 0; i < threadCount; i++) {
+        final int offset = i * readLen;
+        futures.add(executor.submit(() -> {
+          ByteBuffer buffer = ByteBuffer.allocate(readLen);
+          assertEquals(readLen, subject.read(offset, buffer));
+          return buffer.array();
+        }));
+      }
+
+      // Every positioned read must be inside its own ReadChunk before any of them is allowed to finish.
+      assertTrue(insideReadChunk.await(60, TimeUnit.SECONDS),
+          "Positioned reads did not run concurrently");
+      release.countDown();
+
+      for (int i = 0; i < threadCount; i++) {
+        assertArrayEquals(blockDataRange(i * readLen, (i + 1) * readLen), futures.get(i).get());
+      }
+      assertEquals(threadCount, subject.getReadChunkRequests().size());
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testPositionedReadDoesNotDisturbSequentialRead() throws Exception {
+    seekAndVerify(50);
+    byte[] sequential = new byte[120];
+    assertEquals(120, blockStream.read(sequential, 0, 120));
+    matchWithInputData(sequential, 50, 120);
+    assertEquals(170, blockStream.getPos());
+    assertEquals(1, blockStream.getChunkIndex());
+    List<Long> positionsBefore = chunkStreamPositions(blockStream);
+
+    ByteBuffer buffer = ByteBuffer.allocate(150);
+    assertEquals(150, blockStream.read(280, buffer));
+    assertArrayEquals(blockDataRange(280, 430), buffer.array());
+    byte[] preadBytes = new byte[40];
+    assertEquals(40, blockStream.read(10, preadBytes, 0, 40));
+    matchWithInputData(preadBytes, 10, 40);
+
+    // Neither the cursor nor the buffers of the sequential chunk streams have moved.
+    assertEquals(170, blockStream.getPos());
+    assertEquals(1, blockStream.getChunkIndex());
+    assertEquals(positionsBefore, chunkStreamPositions(blockStream));
+
+    // The sequential read continues where it left off.
+    byte[] next = new byte[80];
+    assertEquals(80, blockStream.read(next, 0, 80));
+    matchWithInputData(next, 170, 80);
+    assertEquals(250, blockStream.getPos());
+
+    // ... and so does a sequential read after seek and unbuffer, with positioned reads in between.
+    seekAndVerify(300);
+    blockStream.unbuffer();
+    ByteBuffer afterUnbuffer = ByteBuffer.allocate(60);
+    assertEquals(60, blockStream.read(0, afterUnbuffer));
+    assertArrayEquals(blockDataRange(0, 60), afterUnbuffer.array());
+    assertEquals(300, blockStream.getPos());
+    assertEquals(3, blockStream.getChunkIndex());
+    byte[] afterSeek = new byte[100];
+    assertEquals(100, blockStream.read(afterSeek, 0, 100));
+    matchWithInputData(afterSeek, 300, 100);
+  }
+
+  @Test
+  public void testPreadByteBufferCapability() throws Exception {
+    // No client factory (closed or unit test stream): nothing forces the reads to be serialized.
+    assertTrue(blockStream.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+
+    XceiverClientFactory clientFactory = mock(XceiverClientFactory.class);
+    when(clientFactory.isShortCircuitEnabled()).thenReturn(false);
+    try (BlockInputStream subject = createSubjectWithFactory(clientFactory)) {
+      assertTrue(subject.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+      subject.seek(30);
+      ByteBuffer buffer = ByteBuffer.allocate(150);
+      assertEquals(150, subject.read(120, buffer));
+      assertArrayEquals(blockDataRange(120, 270), buffer.array());
+      assertEquals(30, subject.getPos());
+    }
+
+    XceiverClientFactory shortCircuitFactory = mock(XceiverClientFactory.class);
+    when(shortCircuitFactory.isShortCircuitEnabled()).thenReturn(true);
+    try (BlockInputStream subject = createSubjectWithFactory(shortCircuitFactory)) {
+      // A single FileInputStream is shared by all the chunks of the block, so the positioned read falls
+      // back to the serialized default which moves the cursor and restores it.
+      assertFalse(subject.hasCapability(StreamCapabilities.PREADBYTEBUFFER));
+      assertTrue(subject.hasCapability(StreamCapabilities.READBYTEBUFFER));
+      subject.seek(30);
+      ByteBuffer buffer = ByteBuffer.allocate(150);
+      assertEquals(150, subject.read(120, buffer));
+      assertArrayEquals(blockDataRange(120, 270), buffer.array());
+      assertEquals(30, subject.getPos());
+    }
+  }
+
+  @Test
+  public void testPositionedReadAtEndOfBlock() throws Exception {
+    assertEquals(-1, blockStream.read(blockSize, ByteBuffer.allocate(10)));
+    assertEquals(-1, blockStream.read(blockSize + 10, ByteBuffer.allocate(10)));
+    assertEquals(-1, blockStream.read(-1, ByteBuffer.allocate(10)));
+    assertEquals(0, blockStream.read(0, ByteBuffer.allocate(0)));
+
+    // A read which goes past the end of the block is clamped to the block length.
+    ByteBuffer tail = ByteBuffer.allocate(100);
+    assertEquals(50, blockStream.read(blockSize - 50, tail));
+    assertArrayEquals(blockDataRange(blockSize - 50, blockSize), Arrays.copyOf(tail.array(), 50));
+
+    byte[] b = new byte[120];
+    assertEquals(120, blockStream.read(60, b, 0, 120));
+    matchWithInputData(b, 60, 120);
+    blockStream.readFully(200, b);
+    matchWithInputData(b, 200, 120);
+    assertThrows(EOFException.class, () -> blockStream.readFully(blockSize - 10, new byte[20]));
+    assertEquals(-1, blockStream.read(blockSize, b, 0, 10));
+
+    assertEquals(0, blockStream.getPos());
+  }
+
+  @Test
+  public void testPositionedReadRefreshesPipelineOnFailure() throws Exception {
+    BlockID blockID = new BlockID(new ContainerBlockID(1, 1));
+    BlockLocationInfo blockLocationInfo = mock(BlockLocationInfo.class);
+    when(blockLocationInfo.getPipeline())
+        .thenReturn(MockPipeline.createSingleNodePipeline());
+    when(refreshFunction.apply(any())).thenReturn(blockLocationInfo);
+
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setChecksumVerify(false);
+    clientConfig.setReadRetryInterval(0);
+
+    try (RecordingBlockInputStream subject =
+             new RecordingBlockInputStream(null, false, null, 1, clientConfig)) {
+      ByteBuffer buffer = ByteBuffer.allocate(80);
+      assertEquals(80, subject.read(30, buffer));
+      assertArrayEquals(blockDataRange(30, 110), buffer.array());
+      verify(refreshFunction, times(1)).apply(blockID);
+      // The first ReadChunk failed and was retried on a fresh ephemeral stream.
+      assertEquals(3, subject.getReadChunkRequests().size());
+
+      // The sequential read is not affected by the failed positioned read.
+      byte[] b = new byte[200];
+      assertEquals(200, subject.read(b, 0, 200));
+      matchWithInputData(b, 0, 200);
+      assertEquals(200, subject.getPos());
+      assertEquals(2, subject.getChunkIndex());
+    }
+  }
+
+  @Test
+  public void testPreadDoesNotWaitForParkedSequentialRead() throws Exception {
+    final CountDownLatch parked = new CountDownLatch(1);
+    final CountDownLatch release = new CountDownLatch(1);
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setChecksumVerify(false);
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try (SequentialGatingBlockInputStream subject =
+             new SequentialGatingBlockInputStream(parked, release, clientConfig)) {
+      subject.gateNewChunkStreams(true);
+      subject.initialize();
+      subject.gateNewChunkStreams(false);
+
+      byte[] sequential = new byte[50];
+      Future<Integer> sequentialRead =
+          executor.submit(() -> subject.read(sequential, 0, sequential.length));
+      // The sequential read now holds the monitor of the stream inside readWithStrategy and is parked
+      // inside the readChunk of the chunk stream created by initialize().
+      assertTrue(parked.await(10, TimeUnit.SECONDS), "The sequential read never reached readChunk");
+
+      Future<byte[]> positionedRead = executor.submit(() -> {
+        ByteBuffer buffer = ByteBuffer.allocate(50);
+        assertEquals(50, subject.read(100, buffer));
+        return buffer.array();
+      });
+      assertArrayEquals(blockDataRange(100, 150), positionedRead.get(10, TimeUnit.SECONDS));
+
+      // The positioned read issued its own ReadChunk on an ephemeral, ungated chunk stream while the
+      // sequential read was still parked in its own.
+      List<ChunkInfo> requests = subject.getReadChunkRequests();
+      assertEquals(2, requests.size());
+      assertEquals("chunk-0", requests.get(0).getChunkName());
+      assertEquals("chunk-1", requests.get(1).getChunkName());
+
+      release.countDown();
+      assertEquals(50, sequentialRead.get(10, TimeUnit.SECONDS).intValue());
+      matchWithInputData(sequential, 0, 50);
+      assertEquals(50, subject.getPos());
+      assertEquals(1, subject.getBlockDataCount());
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testPreadAfterCloseThrows() throws Exception {
+    XceiverClientFactory clientFactory = mock(XceiverClientFactory.class);
+    when(clientFactory.isShortCircuitEnabled()).thenReturn(false);
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setChecksumVerify(false);
+
+    // DummyBlockInputStream cannot express this: its checkOpen() is a no-op whatever the factory is.
+    BlockInputStream subject = new BlockInputStream(
+        new BlockLocationInfo(new BlockLocationInfo.Builder()
+            .setBlockID(new BlockID(new ContainerBlockID(1, 1))).setLength(blockSize)),
+        MockPipeline.createSingleNodePipeline(), null, clientFactory, refreshFunction, clientConfig) {
+      @Override
+      protected ContainerProtos.BlockData getBlockData() {
+        return ContainerProtos.BlockData.newBuilder().addAllChunks(chunks)
+            .setBlockID(getBlockID().getDatanodeBlockIDProtobuf()).build();
+      }
+
+      @Override
+      protected ChunkInputStream createChunkInputStream(ChunkInfo chunkInfo) {
+        return new DummyChunkInputStream(chunkInfo, null, null, false,
+            chunkDataMap.get(chunkInfo.getChunkName()).clone(), null);
+      }
+    };
+
+    ByteBuffer buffer = ByteBuffer.allocate(80);
+    assertEquals(80, subject.read(30, buffer));
+    assertArrayEquals(blockDataRange(30, 110), buffer.array());
+
+    subject.close();
+    IOException ex = assertThrows(IOException.class, () -> subject.read(30, ByteBuffer.allocate(80)));
+    assertThat(ex.getMessage()).contains("has been closed");
+  }
+
+  private BlockInputStream createSubjectWithFactory(XceiverClientFactory clientFactory)
+      throws IOException {
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setChecksumVerify(false);
+    return new DummyBlockInputStream(new BlockID(new ContainerBlockID(1, 1)), blockSize,
+        MockPipeline.createSingleNodePipeline(), null, clientFactory, refreshFunction, chunks,
+        chunkDataMap, clientConfig);
+  }
+
+  private RecordingBlockInputStream createRecordingStream(boolean chunkVerifyChecksum)
+      throws IOException {
+    return createRecordingStream(chunkVerifyChecksum, null, 0);
+  }
+
+  private RecordingBlockInputStream createRecordingStream(boolean chunkVerifyChecksum,
+      Runnable readChunkGate, int failures) throws IOException {
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setChecksumVerify(false);
+    clientConfig.setReadRetryInterval(0);
+    return new RecordingBlockInputStream(null, chunkVerifyChecksum, readChunkGate, failures,
+        clientConfig);
+  }
+
+  /**
+   * A DummyBlockInputStream which records the ChunkInfo of every ReadChunk issued by the streams it
+   * creates, counts the GetBlock calls, and can gate or fail the reads.
+   */
+  private final class RecordingBlockInputStream extends DummyBlockInputStream {
+
+    private final List<ChunkInfo> readChunkRequests =
+        Collections.synchronizedList(new ArrayList<>());
+    private final AtomicInteger getBlockDataCount = new AtomicInteger();
+    private final AtomicInteger failuresToInject;
+    private final boolean chunkVerifyChecksum;
+    private final Runnable readChunkGate;
+
+    RecordingBlockInputStream(XceiverClientFactory clientFactory, boolean chunkVerifyChecksum,
+        Runnable readChunkGate, int failures, OzoneClientConfig config) throws IOException {
+      super(new BlockID(new ContainerBlockID(1, 1)), blockSize,
+          MockPipeline.createSingleNodePipeline(), null, clientFactory, refreshFunction, chunks,
+          chunkDataMap, config);
+      this.chunkVerifyChecksum = chunkVerifyChecksum;
+      this.readChunkGate = readChunkGate;
+      this.failuresToInject = new AtomicInteger(failures);
+    }
+
+    @Override
+    protected ContainerProtos.BlockData getBlockData() throws IOException {
+      getBlockDataCount.incrementAndGet();
+      return super.getBlockData();
+    }
+
+    @Override
+    protected ChunkInputStream createChunkInputStream(ChunkInfo chunkInfo) {
+      return new DummyChunkInputStream(chunkInfo, null, null, chunkVerifyChecksum,
+          chunkDataMap.get(chunkInfo.getChunkName()), null) {
+        @Override
+        protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo) throws IOException {
+          readChunkRequests.add(readChunkInfo);
+          if (failuresToInject.getAndUpdate(count -> count > 0 ? count - 1 : 0) > 0) {
+            throw new StorageContainerException("Simulated read failure", CONTAINER_NOT_FOUND);
+          }
+          if (readChunkGate != null) {
+            readChunkGate.run();
+          }
+          return super.readChunk(readChunkInfo);
+        }
+      };
+    }
+
+    List<ChunkInfo> getReadChunkRequests() {
+      return readChunkRequests;
+    }
+
+    int getBlockDataCount() {
+      return getBlockDataCount.get();
+    }
+  }
+
+  /**
+   * A DummyBlockInputStream whose chunk streams created while {@link #gateNewChunkStreams(boolean)} is on
+   * park inside readChunk until they are released, so that a sequential read can be held inside a chunk
+   * stream of the block while the ephemeral chunk streams of the positioned reads run freely.
+   */
+  private final class SequentialGatingBlockInputStream extends DummyBlockInputStream {
+
+    private final List<ChunkInfo> readChunkRequests =
+        Collections.synchronizedList(new ArrayList<>());
+    private final AtomicInteger getBlockDataCount = new AtomicInteger();
+    private final AtomicBoolean gateNewStreams = new AtomicBoolean();
+    private final CountDownLatch parked;
+    private final CountDownLatch release;
+
+    SequentialGatingBlockInputStream(CountDownLatch parked, CountDownLatch release,
+        OzoneClientConfig config) throws IOException {
+      super(new BlockID(new ContainerBlockID(1, 1)), blockSize,
+          MockPipeline.createSingleNodePipeline(), null, null, refreshFunction, chunks,
+          chunkDataMap, config);
+      this.parked = parked;
+      this.release = release;
+    }
+
+    void gateNewChunkStreams(boolean gate) {
+      gateNewStreams.set(gate);
+    }
+
+    @Override
+    protected ContainerProtos.BlockData getBlockData() throws IOException {
+      getBlockDataCount.incrementAndGet();
+      return super.getBlockData();
+    }
+
+    @Override
+    protected ChunkInputStream createChunkInputStream(ChunkInfo chunkInfo) {
+      final boolean gated = gateNewStreams.get();
+      return new DummyChunkInputStream(chunkInfo, null, null, false,
+          chunkDataMap.get(chunkInfo.getChunkName()), null) {
+        @Override
+        protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo) throws IOException {
+          readChunkRequests.add(readChunkInfo);
+          if (gated) {
+            parked.countDown();
+            try {
+              assertTrue(release.await(60, TimeUnit.SECONDS), "readChunk was never released");
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new IllegalStateException(e);
+            }
+          }
+          return super.readChunk(readChunkInfo);
+        }
+      };
+    }
+
+    List<ChunkInfo> getReadChunkRequests() {
+      return readChunkRequests;
+    }
+
+    int getBlockDataCount() {
+      return getBlockDataCount.get();
+    }
   }
 }

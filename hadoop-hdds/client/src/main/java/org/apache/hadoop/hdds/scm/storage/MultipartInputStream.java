@@ -27,6 +27,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import org.apache.hadoop.fs.FSExceptionMessages;
+import org.apache.hadoop.fs.StreamCapabilities;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.ratis.util.Preconditions;
 
 /**
@@ -35,7 +37,7 @@ import org.apache.ratis.util.Preconditions;
 public class MultipartInputStream extends ExtendedInputStream {
 
   private final String key;
-  private long length;
+  private volatile long length;
 
   // List of PartInputStream, one for each part of the key
   private final List<? extends PartInputStream> partStreams;
@@ -49,7 +51,7 @@ public class MultipartInputStream extends ExtendedInputStream {
   // part[0]), partOffsets[1] = 200 and so on.
   private final long[] partOffsets;
 
-  private boolean closed;
+  private volatile boolean closed;
   // Index of the partStream corresponding to the current position of the
   // MultipartCryptoKeyInputStream.
   private int partIndex;
@@ -58,7 +60,7 @@ public class MultipartInputStream extends ExtendedInputStream {
   // can be reset if a new position is seeked.
   private int prevPartIndex;
 
-  private boolean initialized = false;
+  private volatile boolean initialized = false;
 
   public MultipartInputStream(String keyName,
                               List<? extends PartInputStream> inputStreams) {
@@ -189,34 +191,84 @@ public class MultipartInputStream extends ExtendedInputStream {
     prevPartIndex = partIndex;
   }
 
+  /**
+   * Positioned read which does not move the cursor of this stream and does not hold its lock while reading
+   * from a part, so it can run concurrently with other reads on the same stream. The position is mapped to
+   * the covering part via {@link #partOffsets} and the read is spread over the parts it covers.
+   *
+   * @param position the position in the key to read from.
+   * @param dst the buffer to read into.
+   * @return the number of bytes copied into {@code dst}, or -1 if no byte could be read.
+   */
   @Override
-  public boolean readFully(long position, ByteBuffer buffer) throws IOException {
-    if (!isStreamBlockInputStream) {
-      return false;
+  public int read(long position, ByteBuffer dst) throws IOException {
+    checkOpen();
+    // After the one-time initialization the key length and the part lengths are final, and this positioned
+    // read takes no monitor of this stream on any path.
+    if (!initialized) {
+      initialize();
     }
 
-    final long oldPos = getPos();
-    seek(position);
-    try {
-      int remainingBeforeRead = buffer.remaining();
-      if (remainingBeforeRead == 0) {
-        return true;
-      }
-      read(new ByteBufferReader(buffer) {
-        @Override
-        int readImpl(InputStream inputStream) throws IOException {
-          return Preconditions.assertInstanceOf(inputStream, StreamBlockInputStream.class)
-              .readFully(getBuffer(), false);
-        }
-      });
-      if (remainingBeforeRead - buffer.remaining() == 0) {
-        throw new EOFException("EOF encountered at pos: " + position +
-            " for key: " + key);
-      }
-    } finally {
-      seek(oldPos);
+    final long keyLength = length;
+    if (!dst.hasRemaining()) {
+      return 0;
     }
-    return true;
+    if (position < 0 || position >= keyLength) {
+      return EOF;
+    }
+
+    int index = Arrays.binarySearch(partOffsets, position);
+    if (index < 0) {
+      // Binary search returns -insertionPoint - 1 if the element is not present in the array, and the
+      // covering part is the one starting just below the position, i.e. insertionPoint - 1.
+      index = -index - 2;
+    }
+
+    long pos = position;
+    int totalReadLen = 0;
+    while (dst.hasRemaining() && pos < keyLength && index < partStreams.size()) {
+      final PartInputStream part = partStreams.get(index);
+      final long partOffset = pos - partOffsets[index];
+      final long partLength = part.getLength();
+      final int numBytesToRead = (int) Math.min(dst.remaining(), partLength - partOffset);
+      if (numBytesToRead <= 0) {
+        index++;
+        continue;
+      }
+
+      final int numBytesRead;
+      final int oldLimit = dst.limit();
+      dst.limit(dst.position() + numBytesToRead);
+      try {
+        numBytesRead = part.read(partOffset, dst);
+      } finally {
+        dst.limit(oldLimit);
+      }
+      checkPartBytesRead(numBytesToRead, numBytesRead, part);
+      if (numBytesRead <= 0) {
+        break;
+      }
+
+      totalReadLen += numBytesRead;
+      pos += numBytesRead;
+      if (partOffset + numBytesRead >= partLength) {
+        index++;
+      }
+    }
+    return totalReadLen == 0 ? EOF : totalReadLen;
+  }
+
+  @Override
+  public boolean hasCapability(String capability) {
+    if (StreamCapabilities.PREADBYTEBUFFER.equals(StringUtils.toLowerCase(capability))) {
+      for (PartInputStream part : partStreams) {
+        if (!part.hasCapability(capability)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return super.hasCapability(capability);
   }
 
   public synchronized void initialize() throws IOException {
