@@ -299,6 +299,12 @@ public abstract class Handler {
    */
   public abstract Container importContainer(ContainerData targetTempContainerData) throws IOException;
 
+  /**
+   * Serve one request of a streaming ReadBlock call: the data is delivered to {@code streamObserver} and null is
+   * returned, or an error response is returned instead. The data of each response may wrap the read buffer of
+   * {@code blockFile}, which is refilled once {@code streamObserver.onNext} returns, so the observer must serialize
+   * or copy the payload inside {@code onNext}.
+   */
   public abstract ContainerCommandResponseProto readBlock(
       ContainerCommandRequestProto msg, Container container,
       RandomAccessFileChannel blockFile,

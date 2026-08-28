@@ -98,6 +98,8 @@ public interface ContainerDispatcher {
 
   /**
    * When reading data form client by streaming chunks.
+   * The data of each response may wrap the read buffer of {@code blockFile}, which is refilled once
+   * {@code streamObserver.onNext} returns, so the observer must serialize or copy the payload inside {@code onNext}.
    */
   default void streamDataReadOnly(
        ContainerCommandRequestProto msg,
