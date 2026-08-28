@@ -34,6 +34,7 @@ import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Res
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.INVALID_CONTAINER_STATE;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.IO_EXCEPTION;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.MALFORMED_REQUEST;
+import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.NO_SUCH_BLOCK;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.PUT_SMALL_FILE_ERROR;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.UNCLOSED_CONTAINER_IO;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.UNSUPPORTED_REQUEST;
@@ -170,6 +171,7 @@ import org.apache.hadoop.ozone.container.keyvalue.impl.BlockManagerImpl;
 import org.apache.hadoop.ozone.container.keyvalue.impl.ChunkManagerFactory;
 import org.apache.hadoop.ozone.container.keyvalue.interfaces.BlockManager;
 import org.apache.hadoop.ozone.container.keyvalue.interfaces.ChunkManager;
+import org.apache.hadoop.ozone.container.metadata.DatanodeStore;
 import org.apache.hadoop.ozone.container.ozoneimpl.OzoneContainer;
 import org.apache.hadoop.ozone.container.upgrade.VersionedDatanodeFeatures;
 import org.apache.hadoop.security.token.Token;
@@ -2328,9 +2330,12 @@ public class KeyValueHandler extends Handler {
       Container kvContainer, StreamObserver<ContainerCommandResponseProto> streamObserver, boolean verifyChecksum)
       throws IOException {
     final ReadBlockRequestProto readBlock = request.getReadBlock();
+    // The client chooses the response size, which is a uint32 and sizes a buffer kept for the whole stream: bound it.
     int responseDataSize = readBlock.getResponseDataSize();
-    if (responseDataSize == 0) {
+    if (responseDataSize <= 0) {
       responseDataSize = 1 << 20;
+    } else if (responseDataSize > OzoneConsts.OZONE_SCM_CHUNK_MAX_SIZE) {
+      responseDataSize = OzoneConsts.OZONE_SCM_CHUNK_MAX_SIZE;
     }
 
     final BlockID blockID = BlockID.getFromProtobuf(readBlock.getBlockID());
@@ -2343,16 +2348,24 @@ public class KeyValueHandler extends Handler {
     BlockUtils.verifyReplicaIdx(kvContainer, blockID);
     BlockUtils.verifyBCSId(kvContainer, blockID);
 
-    final BlockData blockData = getBlockManager().getBlock(kvContainer, blockID);
+    if (readBlock.getOffset() < 0 || readBlock.getLength() < 0) {
+      return rejectReadBlock(blockFile, streamObserver, Status.INVALID_ARGUMENT.withDescription(
+          "Negative offset " + readBlock.getOffset() + " or length " + readBlock.getLength() + " for " + blockID));
+    }
+
+    // Resolve the BlockData once per stream. Re-resolve if the range reaches the cached size (the block may have
+    // grown); on a hit, only check that the block still exists.
+    BlockData blockData = blockFile.getCachedBlockData(blockID);
+    if (blockData == null || readBlock.getLength() >= blockData.getSize() - readBlock.getOffset()) {
+      blockData = getBlockManager().getBlock(kvContainer, blockID);
+      blockFile.cacheBlockData(blockID, blockData);
+    } else if (!getBlockManager().blockExists(kvContainer, blockID)) {
+      throw new StorageContainerException(DatanodeStore.NO_SUCH_BLOCK_ERR_MSG + " BlockID : " + blockID, NO_SUCH_BLOCK);
+    }
     if (readBlock.getOffset() >= blockData.getSize()) {
-      // An out of range offset is a client fault, so report it on the stream instead of throwing: throwing would be
-      // turned into a CONTAINER_INTERNAL_ERROR response by readBlock, and a non-null response makes the dispatcher
-      // scan the container as if the data were corrupt.
-      streamObserver.onError(Status.OUT_OF_RANGE
-          .withDescription("Requested offset " + readBlock.getOffset() + " is beyond the end of block " + blockID
-              + " with size " + blockData.getSize())
-          .asRuntimeException());
-      return 0;
+      return rejectReadBlock(blockFile, streamObserver, Status.OUT_OF_RANGE.withDescription(
+          "Requested offset " + readBlock.getOffset() + " is beyond the end of block " + blockID + " with size "
+              + blockData.getSize()));
     }
     final List<ContainerProtos.ChunkInfo> chunkInfos = blockData.getChunks();
     final int bytesPerChunk = Math.toIntExact(chunkInfos.get(0).getLen());
@@ -2372,7 +2385,8 @@ public class KeyValueHandler extends Handler {
     final long offsetAlignment = readBlock.getOffset() % bytesPerChecksum;
     long adjustedOffset = readBlock.getOffset() - offsetAlignment;
 
-    final ByteBuffer buffer = ByteBuffer.allocate(responseDataSize);
+    // Reused across the stream's requests: gRPC serializes the response inside onNext, before the buffer is refilled.
+    final ByteBuffer buffer = blockFile.getReadBuffer(responseDataSize);
     blockFile.position(adjustedOffset);
     long totalDataLength = 0;
     int numResponses = 0;
@@ -2381,6 +2395,8 @@ public class KeyValueHandler extends Handler {
     LOG.debug("adjustedOffset {}, requiredLength {}, blockSize {}",
         adjustedOffset, requiredLength, blockData.getSize());
     for (boolean shouldRead = true; totalDataLength < requiredLength && shouldRead;) {
+      // Never read past the cached BlockData: the file may have grown, but the chunk list has no checksums for that.
+      buffer.limit(Math.toIntExact(Math.min(buffer.capacity(), blockData.getSize() - adjustedOffset)));
       shouldRead = blockFile.read(buffer);
       buffer.flip();
       final int readLength = buffer.remaining();
@@ -2401,7 +2417,7 @@ public class KeyValueHandler extends Handler {
         }
       }
       final ContainerCommandResponseProto response = getReadBlockResponse(
-          request, checksumData, buffer, adjustedOffset);
+          request, checksumData, buffer, adjustedOffset, byteBufferToByteString);
       final int dataLength = response.getReadBlock().getData().size();
       LOG.debug("server onNext response {}: dataLength={}, numChecksums={}",
           numResponses, dataLength, response.getReadBlock().getChecksumData().getChecksumsList().size());
@@ -2413,6 +2429,18 @@ public class KeyValueHandler extends Handler {
       numResponses++;
     }
     return totalDataLength;
+  }
+
+  /**
+   * Report a client fault on the stream instead of throwing, which would become a CONTAINER_INTERNAL_ERROR response
+   * and make the dispatcher scan the container. This ends the call from the datanode side, so also close the stream's
+   * block file: GrpcXceiverService closes it only when the client ends the stream or a request throws.
+   */
+  private static long rejectReadBlock(RandomAccessFileChannel blockFile,
+      StreamObserver<ContainerCommandResponseProto> streamObserver, Status status) {
+    blockFile.close();
+    streamObserver.onError(status.asRuntimeException());
+    return 0;
   }
 
   static List<ByteString> getChecksums(long blockOffset, int readLength, int bytesPerChunk, int bytesPerChecksum,

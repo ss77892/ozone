@@ -21,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doThrow;
@@ -36,7 +38,10 @@ import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import org.apache.hadoop.hdds.client.BlockID;
+import org.apache.hadoop.ozone.container.common.helpers.BlockData;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -141,6 +146,26 @@ class TestRandomAccessFileChannel {
     try (Closeable c = closeable) {
       assertNotNull(c);
     }
+  }
+
+  @Test
+  void blockDataIsCachedPerBlockAndClearedOnClose() throws Exception {
+    final RandomAccessFileChannel c = new RandomAccessFileChannel();
+    c.open(Files.createFile(tempDir.resolve("cached-block")).toFile());
+
+    final BlockID blockID = new BlockID(1, 2);
+    final BlockData blockData = new BlockData(blockID);
+    assertNull(c.getCachedBlockData(blockID));
+
+    c.cacheBlockData(blockID, blockData);
+    assertSame(blockData, c.getCachedBlockData(blockID));
+    assertNull(c.getCachedBlockData(new BlockID(1, 3)));
+    final BlockID grown = new BlockID(1, 2);
+    grown.setBlockCommitSequenceId(7);
+    assertNull(c.getCachedBlockData(grown));
+
+    c.close();
+    assertNull(c.getCachedBlockData(blockID));
   }
 
   private static void setField(Object target, String name, Object value)
