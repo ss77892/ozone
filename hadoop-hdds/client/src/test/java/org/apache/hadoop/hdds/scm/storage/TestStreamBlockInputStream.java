@@ -823,6 +823,65 @@ public class TestStreamBlockInputStream {
   }
 
   /**
+   * When a sender is parked in {@code awaitReady()} and the stream terminates before it becomes ready,
+   * {@code streamRead()} throws an {@link IOException} wrapping the terminating gRPC status. If the reader
+   * already recorded a richer failure via an in-band error response (e.g. a {@link StorageContainerException}
+   * from {@code failOnErrorResponse}), that failure must surface so
+   * {@link org.apache.hadoop.hdds.utils.ConnectionFailureUtils#unwrapCause} can classify it and
+   * {@code handleExceptions} can retry.
+   */
+  @Test
+  public void testStreamReadThrowSurfacesReaderRecordedFailure() throws Exception {
+    OzoneClientConfig clientConfig = newStreamReadConfig();
+    clientConfig.setMaxReadRetryCount(0);
+    BlockID blockID = new BlockID(1L, 22L);
+    ClientCallStreamObserver<ContainerCommandRequestProto> requestObserver =
+        mock(ClientCallStreamObserver.class);
+
+    // Simulate the sender-stalled race: the reader captures a StorageContainerException from an in-band
+    // error response, and streamRead() then throws the plain IOException(StatusRuntimeException(CANCELLED))
+    // that awaitReady() would produce after signalTerminated() fires.
+    StreamingReadResponse streamingReadResponse = mock(StreamingReadResponse.class);
+    when(streamingReadResponse.getRequestObserver()).thenReturn(requestObserver);
+    AtomicReference<StreamingReaderSpi> readerRef = new AtomicReference<>();
+    XceiverClientGrpc xceiverClient = mock(XceiverClientGrpc.class);
+    doAnswer(inv -> {
+      StreamingReaderSpi reader = inv.getArgument(1);
+      reader.setStreamingReadResponse(streamingReadResponse);
+      readerRef.set(reader);
+      return null;
+    }).when(xceiverClient).initStreamRead(any(BlockID.class), any(), any());
+    doAnswer(inv -> {
+      readerRef.get().onNext(ContainerCommandResponseProto.newBuilder()
+          .setCmdType(Type.ReadBlock)
+          .setResult(ContainerProtos.Result.CONTAINER_NOT_FOUND)
+          .setMessage("Container not found")
+          .build());
+      throw new IOException("Stream terminated while waiting for it to become ready",
+          Status.CANCELLED.asRuntimeException());
+    }).when(xceiverClient).streamRead(any(), any());
+
+    XceiverClientFactory xceiverClientFactory = mock(XceiverClientFactory.class);
+    when(xceiverClientFactory.acquireClientForReadData(any(Pipeline.class)))
+        .thenReturn(xceiverClient);
+
+    try (StreamBlockInputStream sbis = new StreamBlockInputStream(
+        blockID, 1024L, mockStandalonePipeline(), null, xceiverClientFactory,
+        NO_REFRESH, clientConfig)) {
+
+      ByteBuffer buf = ByteBuffer.allocate(1024);
+      IOException thrown = assertThrows(IOException.class, () -> sbis.read(buf));
+
+      // The recorded StorageContainerException must reach the caller directly, not buried under the
+      // awaitReady() wrapper. That is what handleExceptions() needs to classify the failure as retriable.
+      assertThat(thrown).isInstanceOf(StorageContainerException.class);
+      // The awaitReady() IOException wrapper is preserved as a suppressed exception for diagnostics.
+      assertThat(thrown.getSuppressed()).hasSize(1);
+      assertThat(hasCause(thrown.getSuppressed()[0], StatusRuntimeException.class)).isTrue();
+    }
+  }
+
+  /**
    * Mocks a streaming read client which captures the StreamingReaderSpi during
    * initStreamRead and drives the given callback when a ReadBlock request is sent.
    */

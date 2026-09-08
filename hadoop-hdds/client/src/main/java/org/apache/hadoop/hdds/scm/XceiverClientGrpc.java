@@ -579,7 +579,9 @@ public class XceiverClientGrpc extends XceiverClientSpi {
         }
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        throw new InterruptedIOException("Interrupted while waiting for stream to become ready: " + streamObserver);
+        throw (IOException) new InterruptedIOException(
+            "Interrupted while waiting for stream to become ready: " + streamObserver)
+            .initCause(e);
       }
     }
 
@@ -665,12 +667,17 @@ public class XceiverClientGrpc extends XceiverClientSpi {
 
     @Override
     public void onError(Throwable t) {
+      // Wake any sender parked in awaitReady() before invoking the reader. The reader's onError
+      // path ends in releaseStreamResources(), which is synchronized on the StreamBlockInputStream
+      // that the parked sender still holds via readBlockImpl(); calling it first would keep the
+      // sender parked until awaitReady() times out.
       response.signalTerminated(t);
       reader.onError(t);
     }
 
     @Override
     public void onCompleted() {
+      // See onError() for the ordering rationale.
       response.signalTerminated(null);
       reader.onCompleted();
     }

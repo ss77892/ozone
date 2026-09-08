@@ -21,6 +21,7 @@ import static org.apache.ratis.thirdparty.io.grpc.Status.Code.CANCELLED;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.HashSet;
@@ -371,8 +372,21 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
     if (r == null) {
       throw new IOException("Uninitialized StreamingReadResponse: " + blockID);
     }
-    xceiverClient.streamRead(ContainerProtocolCalls.buildReadBlockCommandProto(
-        blockID, requestedLength, length, responseDataSize, tokenRef.get(), pipelineRef.get()), r);
+    try {
+      xceiverClient.streamRead(ContainerProtocolCalls.buildReadBlockCommandProto(
+          blockID, requestedLength, length, responseDataSize, tokenRef.get(), pipelineRef.get()), r);
+    } catch (IOException e) {
+      // A sender parked in awaitReady() wakes up with a plain IOException wrapping the terminating
+      // status (typically a StatusRuntimeException). If the reader has already recorded a semantically
+      // richer failure — e.g. a StorageContainerException from an in-band error response — prefer that
+      // so handleExceptions() can classify and retry it correctly.
+      final IOException recorded = streamingReader.recordedFailureOrNull();
+      if (recorded != null && recorded != e) {
+        recorded.addSuppressed(e);
+        throw recorded;
+      }
+      throw e;
+    }
   }
 
   private void handleExceptions(IOException cause) throws IOException {
@@ -499,6 +513,32 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
         } catch (InterruptedException | ExecutionException e) {
           throw new IOException("Streaming read failed", e);
         }
+      }
+    }
+
+    /**
+     * Returns the failure the reader has recorded (via {@link #setFailed}) if the stream has
+     * terminated exceptionally, unwrapping the {@link ExecutionException} so
+     * {@link ConnectionFailureUtils#unwrapCause} can classify it. Returns null if the stream
+     * has not terminated exceptionally.
+     */
+    IOException recordedFailureOrNull() {
+      if (!future.isCompletedExceptionally()) {
+        return null;
+      }
+      try {
+        future.get();
+        return null;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return (IOException) new InterruptedIOException(
+            this + ": Interrupted inspecting recorded failure").initCause(e);
+      } catch (ExecutionException e) {
+        final Throwable cause = e.getCause();
+        if (cause instanceof IOException) {
+          return (IOException) cause;
+        }
+        return new IOException(this + ": Streaming read failed", cause);
       }
     }
 
