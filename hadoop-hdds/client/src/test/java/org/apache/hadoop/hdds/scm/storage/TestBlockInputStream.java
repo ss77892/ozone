@@ -538,6 +538,19 @@ public class TestBlockInputStream {
   }
 
   @Test
+  public void testPositionedReadOnClosedStreamBeforeInitialize() throws Exception {
+    BlockID blockID = new BlockID(new ContainerBlockID(1, 1));
+    Pipeline pipeline = MockPipeline.createSingleNodePipeline();
+    BlockInputStream subject = new BlockInputStream(
+        new BlockLocationInfo(new BlockLocationInfo.Builder().setBlockID(blockID).setLength(blockSize)),
+        pipeline, null, mock(XceiverClientFactory.class), refreshFunction, clientConfig);
+    subject.close();
+    // The stream must not try to fetch the block data without a client.
+    IOException e = assertThrows(IOException.class, () -> subject.readPositioned(0, ByteBuffer.allocate(1)));
+    assertThat(e.getMessage()).contains("has been closed");
+  }
+
+  @Test
   public void testPositionedReadAtEof() throws Exception {
     ByteBuffer empty = ByteBuffer.allocate(0);
     for (long position : new long[] {0, blockSize, blockSize + 1}) {

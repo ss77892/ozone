@@ -339,7 +339,15 @@ public final class ECStreamTestUtil {
     }
 
     @Override
-    protected int readPositioned(long position, ByteBuffer buffer) {
+    protected int readPositioned(long position, ByteBuffer buffer) throws IOException {
+      if (shouldError) {
+        throwError();
+      }
+      awaitReadBarrier();
+      // like read(ByteBuffer), a read that was in flight when the error was set fails too
+      if (shouldError) {
+        throwError();
+      }
       if (position >= length) {
         return EOF;
       }
@@ -372,17 +380,7 @@ public final class ECStreamTestUtil {
       if (shouldError && data.position() >= shouldErrorPosition) {
         throwError();
       }
-      if (readBarrier != null) {
-        readBarrier.countDown();
-        try {
-          if (!readBarrier.await(10, TimeUnit.SECONDS)) {
-            throw new IOException("Timed out waiting for " + readBarrier.getCount() + " concurrent reads");
-          }
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          throw new IOException(e);
-        }
-      }
+      awaitReadBarrier();
       if (getRemaining() == 0) {
         return EOF;
       }
@@ -394,6 +392,20 @@ public final class ECStreamTestUtil {
         buf.put(data.get());
       }
       return toRead;
+    }
+
+    private void awaitReadBarrier() throws IOException {
+      if (readBarrier != null) {
+        readBarrier.countDown();
+        try {
+          if (!readBarrier.await(10, TimeUnit.SECONDS)) {
+            throw new IOException("Timed out waiting for " + readBarrier.getCount() + " concurrent reads");
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException(e);
+        }
+      }
     }
 
     private void throwError() throws IOException {

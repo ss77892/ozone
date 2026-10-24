@@ -18,27 +18,35 @@
 package org.apache.hadoop.ozone.client.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.SplittableRandom;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Stream;
 import org.apache.hadoop.hdds.client.BlockID;
@@ -57,6 +65,7 @@ import org.apache.hadoop.hdds.scm.storage.BlockLocationInfo;
 import org.apache.hadoop.hdds.scm.storage.ByteReaderStrategy;
 import org.apache.hadoop.hdds.security.token.OzoneBlockTokenIdentifier;
 import org.apache.hadoop.security.token.Token;
+import org.apache.ozone.test.GenericTestUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -808,6 +817,286 @@ public class TestECBlockInputStream {
     for (int i = 0; i < length; i++) {
       assertEquals(dataAt(blockOffset + i), buf.get(i), "byte " + i + " at block offset " + (blockOffset + i));
     }
+  }
+
+  @Test
+  void testPositionedReadsReuseOneStreamPerLocation() throws IOException {
+    ECReplicationConfig smallRepConfig = new ECReplicationConfig(3, 2, ECReplicationConfig.EcCodec.RS, 1024);
+    int chunk = smallRepConfig.getEcChunkSize();
+    int blockLength = chunk * 7 - 101;
+    ByteBuffer[] data = new ByteBuffer[smallRepConfig.getData()];
+    for (int i = 0; i < data.length; i++) {
+      data[i] = ByteBuffer.allocate(chunk * 3);
+    }
+    ECStreamTestUtil.randomFill(data, chunk, new SplittableRandom(7), blockLength);
+    byte[] expected = new byte[blockLength];
+    ECStreamTestUtil.randomFill(ByteBuffer.wrap(expected), new SplittableRandom(7));
+    List<ByteBuffer> locationData = new ArrayList<>();
+    for (ByteBuffer b : data) {
+      b.flip();
+      locationData.add(b);
+    }
+    BlockLocationInfo keyInfo = ECStreamTestUtil.createKeyInfo(smallRepConfig, blockLength,
+        ECStreamTestUtil.createIndexMap(1, 2, 3, 4, 5));
+    ECStreamTestUtil.TestBlockInputStreamFactory factory = new ECStreamTestUtil.TestBlockInputStreamFactory();
+    factory.setCurrentPipeline(keyInfo.getPipeline());
+    factory.setBlockStreamData(locationData);
+
+    repConfig = smallRepConfig;
+    try (ECBlockInputStream ecb = createStream(keyInfo, factory, conf.getObject(OzoneClientConfig.class))) {
+      ecb.seek(11);
+      // Offsets within a cell, across cell and stripe boundaries, and into the partial last stripe.
+      int[][] reads = {{0, 10}, {chunk - 5, 10}, {chunk * 2 - 3, chunk + 6}, {chunk * 3 - 1, 2},
+          {chunk * 4 + 17, chunk * 2}, {blockLength - 9, 9}, {5, blockLength - 5}};
+      for (int[] read : reads) {
+        ByteBuffer buffer = ByteBuffer.allocate(read[1]);
+        ecb.readFully(read[0], buffer);
+        assertArrayEquals(Arrays.copyOfRange(expected, read[0], read[0] + read[1]), buffer.array());
+      }
+      assertEquals(-1, ecb.read(blockLength, ByteBuffer.allocate(1)));
+      assertEquals(11, ecb.getPos());
+      assertEquals(smallRepConfig.getData(), factory.getBlockStreams().size());
+      assertEquals(parallelRead, parallelReadTasks.get() > 0);
+
+      // A failing location without a spare surfaces as BadDataLocationException naming that location, and its
+      // pread stream is closed, so the next positioned read opens a new one.
+      ECStreamTestUtil.TestBlockInputStream failedStream = factory.getBlockStream(2);
+      failedStream.setShouldError(true);
+      BadDataLocationException e = assertThrows(BadDataLocationException.class,
+          () -> ecb.read(chunk + 1, ByteBuffer.allocate(10)));
+      assertEquals(1, e.getFailedLocationIndex());
+      assertEquals(failedStream, factory.getBlockStream(2));
+      // Also when the read spans the failing location and a healthy one.
+      factory.setFailIndexes(2);
+      e = assertThrows(BadDataLocationException.class, () -> ecb.read(chunk * 2 - 3, ByteBuffer.allocate(10)));
+      assertEquals(Collections.singletonList(1), e.getFailedLocationIndexes());
+      assertNotEquals(failedStream, factory.getBlockStream(2));
+      // Simultaneous failures on several indexes: the parallel read reports all of them.
+      factory.setFailIndexes(2);
+      factory.getBlockStream(3).setShouldError(true);
+      e = assertThrows(BadDataLocationException.class, () -> ecb.read(chunk + 1, ByteBuffer.allocate(chunk * 2)));
+      assertEquals(parallelRead ? Arrays.asList(1, 2) : Collections.singletonList(1), e.getFailedLocationIndexes());
+    }
+  }
+
+  @Test
+  void testPositionedReadFollowsTheSequentialSwitchToASpare() throws IOException {
+    DatanodeDetails spare = MockDatanodeDetails.randomDatanodeDetails();
+    int blockLength = 3 * 300;
+    BlockLocationInfo keyInfo = createKeyInfoWithSpare(blockLength, spare);
+    ECStreamTestUtil.TestBlockInputStreamFactory factory = createDataStreamFactory(blockLength);
+    factory.setCurrentPipeline(keyInfo.getPipeline());
+
+    try (ECBlockInputStream ecb = createStream(keyInfo, factory, conf.getObject(OzoneClientConfig.class))) {
+      // The positioned read opens its stream for index 2 against the original location.
+      ByteBuffer buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      ECStreamTestUtil.TestBlockInputStream preadStream = factory.getBlockStream(2);
+      DatanodeDetails original = ecb.getDataLocations()[1];
+      assertNotEquals(spare, original);
+
+      // The sequential read fails on index 2 and switches it to the spare; the pread stream stays bound to the
+      // original location.
+      factory.setFailIndexes(2);
+      buf = ByteBuffer.allocate(300);
+      assertEquals(300, ecb.read(buf));
+      assertDataMatches(buf, 0, 300);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      ECStreamTestUtil.TestBlockInputStream spareSequentialStream = factory.getBlockStream(2);
+      assertNotEquals(preadStream, spareSequentialStream);
+
+      // The next positioned read of index 2 does not read from the original location again: the stale pread
+      // stream is replaced by a new one against the spare without failing first.
+      CountDownLatch staleRead = new CountDownLatch(1); // counted down by a read of the stale stream
+      preadStream.setReadBarrier(staleRead);
+      buf = ByteBuffer.allocate(100);
+      assertEquals(100, ecb.read(150, buf));
+      assertDataMatches(buf, 150, 100);
+      assertEquals(1, staleRead.getCount());
+      ECStreamTestUtil.TestBlockInputStream sparePreadStream = factory.getBlockStream(2);
+      assertNotEquals(preadStream, sparePreadStream);
+      assertNotEquals(spareSequentialStream, sparePreadStream);
+
+      // Without another spare, a failing positioned read names the location its stream reads from, the spare,
+      // and the locations that failed before.
+      sparePreadStream.setShouldError(true);
+      BadDataLocationException e = assertThrows(BadDataLocationException.class,
+          () -> ecb.read(120, ByteBuffer.allocate(50)));
+      assertEquals(Arrays.asList(spare, original), e.getFailedLocations());
+      // Also when the read spans the failing index and a healthy one.
+      factory.setFailIndexes(2);
+      e = assertThrows(BadDataLocationException.class, () -> ecb.read(150, ByteBuffer.allocate(100)));
+      assertEquals(Arrays.asList(spare, original), e.getFailedLocations());
+    }
+  }
+
+  @Test
+  void testPositionedReadSwitchesToASpare() throws IOException {
+    DatanodeDetails spare = MockDatanodeDetails.randomDatanodeDetails();
+    int blockLength = 3 * 300;
+    BlockLocationInfo keyInfo = createKeyInfoWithSpare(blockLength, spare);
+    ECStreamTestUtil.TestBlockInputStreamFactory factory = createDataStreamFactory(blockLength);
+    factory.setCurrentPipeline(keyInfo.getPipeline());
+
+    try (ECBlockInputStream ecb = createStream(keyInfo, factory, conf.getObject(OzoneClientConfig.class))) {
+      // The sequential and the positioned read each open their own stream for index 2 against the original.
+      ByteBuffer buf = ByteBuffer.allocate(300);
+      assertEquals(300, ecb.read(buf));
+      assertDataMatches(buf, 0, 300);
+      ECStreamTestUtil.TestBlockInputStream sequentialStream = factory.getBlockStream(2);
+      buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      ECStreamTestUtil.TestBlockInputStream preadStream = factory.getBlockStream(2);
+      assertNotEquals(sequentialStream, preadStream);
+      assertNotEquals(spare, ecb.getDataLocations()[1]);
+
+      // The positioned read fails on index 2 and switches it to the spare, retrying from a new stream.
+      preadStream.setShouldError(true);
+      buf = ByteBuffer.allocate(100);
+      assertEquals(100, ecb.read(150, buf));
+      assertDataMatches(buf, 150, 100);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      ECStreamTestUtil.TestBlockInputStream sparePreadStream = factory.getBlockStream(2);
+      assertNotEquals(preadStream, sparePreadStream);
+
+      // The sequential stream of index 2 was reading from the failed location: the next sequential read reopens
+      // it against the spare, at the expected position.
+      buf = ByteBuffer.allocate(300);
+      assertEquals(300, ecb.read(buf));
+      assertDataMatches(buf, 300, 300);
+      assertNotEquals(sequentialStream, factory.getBlockStream(2));
+      assertNotEquals(sparePreadStream, factory.getBlockStream(2));
+      assertEquals(600, ecb.getPos());
+      assertEquals(100, sequentialStream.getPos()); // not read again
+    }
+  }
+
+  @Test
+  void testConcurrentPositionedReadFailsOnTheLocationOfItsStream() throws Exception {
+    DatanodeDetails spare = MockDatanodeDetails.randomDatanodeDetails();
+    int blockLength = 3 * 300;
+    BlockLocationInfo keyInfo = createKeyInfoWithSpare(blockLength, spare);
+    ECStreamTestUtil.TestBlockInputStreamFactory factory = createDataStreamFactory(blockLength);
+    factory.setCurrentPipeline(keyInfo.getPipeline());
+
+    try (ECBlockInputStream ecb = createStream(keyInfo, factory, conf.getObject(OzoneClientConfig.class))) {
+      // The positioned read opens its stream for index 2 against the original location.
+      ByteBuffer buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      ECStreamTestUtil.TestBlockInputStream preadStream = factory.getBlockStream(2);
+      assertNotEquals(spare, ecb.getDataLocations()[1]);
+
+      // A second positioned read, spanning index 2 and 3, is held in the stream of index 2.
+      CountDownLatch barrier = new CountDownLatch(2);
+      preadStream.setReadBarrier(barrier);
+      ByteBuffer concurrentBuf = ByteBuffer.allocate(100);
+      FutureTask<Integer> concurrentRead = new FutureTask<>(() -> ecb.read(150, concurrentBuf));
+      new Thread(concurrentRead).start();
+      GenericTestUtils.waitFor(() -> barrier.getCount() <= 1 || concurrentRead.isDone(), 10, 10_000);
+      if (concurrentRead.isDone()) {
+        fail("concurrent read finished before reaching the barrier: " + concurrentRead.get());
+      }
+
+      // Meanwhile the stream fails: the first read to notice switches index 2 to the spare and retries from a
+      // new stream.
+      preadStream.setShouldError(true);
+      buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      ECStreamTestUtil.TestBlockInputStream sparePreadStream = factory.getBlockStream(2);
+      assertNotEquals(preadStream, sparePreadStream);
+
+      // The held read fails on the original location, which was already switched: it is retried from the
+      // spare's stream, which is neither blamed nor closed.
+      barrier.countDown();
+      assertEquals(100, concurrentRead.get(10, TimeUnit.SECONDS));
+      assertDataMatches(concurrentBuf, 150, 100);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      assertEquals(sparePreadStream, factory.getBlockStream(2));
+      buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      assertEquals(sparePreadStream, factory.getBlockStream(2));
+    }
+  }
+
+  @Test
+  void testConcurrentPositionedReadDuringTheSwitchToASpareDoesNotReopenTheFailedLocation() throws Exception {
+    DatanodeDetails spare = MockDatanodeDetails.randomDatanodeDetails();
+    int blockLength = 3 * 300;
+    BlockLocationInfo keyInfo = createKeyInfoWithSpare(blockLength, spare);
+    ECStreamTestUtil.TestBlockInputStreamFactory factory = createDataStreamFactory(blockLength);
+    factory.setCurrentPipeline(keyInfo.getPipeline());
+    OzoneClientConfig clientConfig = conf.getObject(OzoneClientConfig.class);
+    clientConfig.setEcParallelReadEnabled(parallelRead);
+
+    AtomicReference<ECStreamTestUtil.TestBlockInputStream> preadStream = new AtomicReference<>();
+    AtomicReference<FutureTask<Integer>> concurrentRead = new AtomicReference<>();
+    ByteBuffer concurrentBuf = ByteBuffer.allocate(50);
+    try (ECBlockInputStream ecb = new ECBlockInputStream(repConfig, keyInfo, null, null, factory, clientConfig,
+        () -> parallelReadExecutor) {
+      @Override
+      protected boolean shouldRetryFailedRead(int failedIndex) {
+        if (concurrentRead.get() == null) {
+          // A positioned read of the same index starts while the failed read switches the index, before the spare
+          // is published.
+          FutureTask<Integer> future = new FutureTask<>(() -> read(120, concurrentBuf));
+          concurrentRead.set(future);
+          Thread thread = new Thread(future);
+          thread.start();
+          try {
+            GenericTestUtils.waitFor(() -> future.isDone() || thread.getState() == Thread.State.BLOCKED, 10, 10_000);
+          } catch (TimeoutException | InterruptedException e) {
+            throw new AssertionError(e);
+          }
+          // It does not open a stream against the failed location: it fails on the stream of the location, still
+          // in place, and waits for the switch.
+          assertEquals(preadStream.get(), factory.getBlockStream(2));
+          assertFalse(future.isDone());
+        }
+        return super.shouldRetryFailedRead(failedIndex);
+      }
+    }) {
+      // The positioned read opens its stream for index 2 against the original location.
+      ByteBuffer buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      preadStream.set(factory.getBlockStream(2));
+      assertNotEquals(spare, ecb.getDataLocations()[1]);
+
+      // The stream fails: the read switches index 2 to the spare and retries from a new stream.
+      preadStream.get().setShouldError(true);
+      buf = ByteBuffer.allocate(50);
+      assertEquals(50, ecb.read(120, buf));
+      assertDataMatches(buf, 120, 50);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      ECStreamTestUtil.TestBlockInputStream sparePreadStream = factory.getBlockStream(2);
+      assertNotEquals(preadStream.get(), sparePreadStream);
+
+      // The concurrent read failed on the original location, which was switched meanwhile: it is retried from the
+      // spare's stream, which is neither blamed nor closed.
+      FutureTask<Integer> future = concurrentRead.get();
+      assertNotNull(future);
+      assertEquals(50, future.get(10, TimeUnit.SECONDS));
+      assertDataMatches(concurrentBuf, 120, 50);
+      assertEquals(spare, ecb.getDataLocations()[1]);
+      assertEquals(sparePreadStream, factory.getBlockStream(2));
+    }
+  }
+
+  /** Creates the key info for a block with an extra, spare location for index 2. */
+  private BlockLocationInfo createKeyInfoWithSpare(int blockLength, DatanodeDetails spare) {
+    repConfig = new ECReplicationConfig(3, 2, ECReplicationConfig.EcCodec.RS, 100);
+    Map<DatanodeDetails, Integer> datanodes = new LinkedHashMap<>();
+    for (int i = 1; i <= repConfig.getRequiredNodes(); i++) {
+      datanodes.put(MockDatanodeDetails.randomDatanodeDetails(), i);
+    }
+    datanodes.put(spare, 2);
+    return ECStreamTestUtil.createKeyInfo(repConfig, blockLength, datanodes);
   }
 
   private void validateBufferContents(ByteBuffer buf, int from, int to,
