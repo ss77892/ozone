@@ -59,6 +59,15 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
   private final CopyOnWriteArrayList<DatanodeDetails> failedLocations;
   private volatile boolean closed = false;
   private OzoneClientConfig config;
+  // Whether every data location was available, so positioned reads can be served by preadReader.
+  private final boolean preadFromDataLocations;
+  // Serves positioned reads until a location fails; it is then closed once no positioned read is inside it, and every
+  // later positioned read is a reconstruction read. Separate from blockReader, which a sequential read may replace.
+  // Guarded by preadLock, not by this, which sequential reads hold across their reads.
+  private final Object preadLock = new Object();
+  private BlockExtendedInputStream preadReader;
+  // Positioned reads inside preadReader, guarded by preadLock.
+  private int preadsInFlight;
 
   /**
    * Given the ECReplicationConfig and the block length, calculate how many
@@ -103,13 +112,18 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
       ECBlockInputStreamFactory streamFactory,
       OzoneClientConfig config) {
     this(repConfig, blockInfo, xceiverClientFactory, refreshFunction, streamFactory, config,
-        new CopyOnWriteArrayList<>());
+        new CopyOnWriteArrayList<>(), false);
   }
 
+  /**
+   * @param perRequest whether the proxy serves a single positioned read of another proxy, which creates one for
+   *     every positioned read once a location has failed or was missing
+   */
+  @SuppressWarnings("checkstyle:ParameterNumber")
   private ECBlockInputStreamProxy(ECReplicationConfig repConfig, BlockLocationInfo blockInfo,
       XceiverClientFactory xceiverClientFactory, Function<BlockID, BlockLocationInfo> refreshFunction,
       ECBlockInputStreamFactory streamFactory, OzoneClientConfig config,
-      CopyOnWriteArrayList<DatanodeDetails> failedLocations) {
+      CopyOnWriteArrayList<DatanodeDetails> failedLocations, boolean perRequest) {
     this.repConfig = repConfig;
     this.blockInfo = blockInfo;
     this.ecBlockInputStreamFactory = streamFactory;
@@ -118,17 +132,23 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
     this.config = config;
     this.failedLocations = failedLocations;
 
-    setReaderType();
+    setReaderType(perRequest);
+    preadFromDataLocations = !reconstructionReader;
     createBlockReader();
   }
 
-  private synchronized void setReaderType() {
+  private synchronized void setReaderType(boolean perRequest) {
     int expected = expectedDataLocations(repConfig, getLength());
     int available = availableDataLocations(blockInfo.getPipeline(), expected);
     reconstructionReader = available < expected || !failedLocations.isEmpty();
     if (reconstructionReader) {
-      LOG.info("Data locations available: {}, expected: {}, failed: {}, using reconstruction read",
-          available, expected, failedLocations.size());
+      String message = "Data locations available: {}, expected: {}, failed: {}, using reconstruction read";
+      if (perRequest) {
+        // logged once per positioned read of the block, so not at INFO
+        LOG.debug(message, available, expected, failedLocations.size());
+      } else {
+        LOG.info(message, available, expected, failedLocations.size());
+      }
     }
   }
 
@@ -216,11 +236,83 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
     if (position >= blockInfo.getLength()) {
       return EOF;
     }
-    // Each request owns its cursor and reconstruction buffers; failed locations are shared.
+    if (preadFromDataLocations && failedLocations.isEmpty()) {
+      final int startPosition = buffer.position();
+      BlockExtendedInputStream reader = acquirePreadReader();
+      if (reader != null) {
+        try {
+          return reader.read(position, buffer);
+        } catch (BadDataLocationException e) {
+          if (closed) {
+            // The stream was closed under the read: the location did not fail.
+            throw new IOException("The stream is closed", e);
+          }
+          String message = "Failing over to reconstruction read due to an error in positioned ECBlockReader.";
+          if (LOG.isDebugEnabled()) {
+            LOG.debug(message, e);
+          } else {
+            LOG.warn("{} Exception Class: {} , Exception Message: {}", message, e.getClass().getName(),
+                e.getMessage());
+          }
+          failedLocations.addAllAbsent(e.getFailedLocations());
+          buffer.position(startPosition);
+        } finally {
+          closeUnusedPreadReader(true);
+        }
+      }
+    }
+    // Once a location has failed or was missing, each positioned read is a reconstruction read with its own cursor and
+    // reconstruction buffers, as ECBlockReconstructedStripeInputStream has no cursor-free positioned read; failed
+    // locations are shared.
     try (ECBlockInputStreamProxy reader = new ECBlockInputStreamProxy(repConfig, blockInfo,
-        xceiverClientFactory, refreshFunction, ecBlockInputStreamFactory, config, failedLocations)) {
+        xceiverClientFactory, refreshFunction, ecBlockInputStreamFactory, config, failedLocations, true)) {
       reader.seek(position);
       return reader.read(buffer);
+    }
+  }
+
+  /**
+   * Returns preadReader, created if needed, with the calling positioned read counted as inside it, or null once a
+   * location has failed, as positioned reads are then reconstruction reads. Decided under preadLock, so a positioned
+   * read cannot recreate a preadReader that a failure has just closed.
+   */
+  private BlockExtendedInputStream acquirePreadReader() throws IOException {
+    synchronized (preadLock) {
+      ensureNotClosed();
+      if (!failedLocations.isEmpty()) {
+        return null;
+      }
+      if (preadReader == null) {
+        preadReader = ecBlockInputStreamFactory.create(false, failedLocations, repConfig, blockInfo,
+            xceiverClientFactory, refreshFunction, config);
+      }
+      preadsInFlight++;
+      return preadReader;
+    }
+  }
+
+  /**
+   * Closes preadReader once a location has failed and no positioned read is inside it, outside preadLock, which must
+   * not wait on a positioned read inside the reader.
+   * @param release whether the calling positioned read leaves preadReader
+   */
+  private void closeUnusedPreadReader(boolean release) {
+    BlockExtendedInputStream unused = null;
+    synchronized (preadLock) {
+      if (release) {
+        preadsInFlight--;
+      }
+      if (preadReader != null && preadsInFlight == 0 && !failedLocations.isEmpty()) {
+        unused = preadReader;
+        preadReader = null;
+      }
+    }
+    if (unused != null) {
+      try {
+        unused.close();
+      } catch (IOException e) {
+        LOG.warn("Failed to close the positioned ECBlockReader of {}", blockInfo.getBlockID(), e);
+      }
     }
   }
 
@@ -229,6 +321,7 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
       throws IOException {
     if (badLocations != null) {
       failedLocations.addAllAbsent(badLocations);
+      closeUnusedPreadReader(false);
     }
     blockReader.close();
     reconstructionReader = true;
@@ -248,8 +341,19 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
   }
 
   @Override
-  public synchronized void unbuffer() {
-    blockReader.unbuffer();
+  public void unbuffer() {
+    synchronized (this) {
+      blockReader.unbuffer();
+    }
+    BlockExtendedInputStream reader;
+    synchronized (preadLock) {
+      reader = preadReader;
+    }
+    // Unbuffered outside both monitors, as a positioned read inside the reader may be slow. The reader is kept, so the
+    // next positioned read does not repeat the GetBlock of each index.
+    if (reader != null) {
+      reader.unbuffer();
+    }
   }
 
   @Override
@@ -276,6 +380,15 @@ public class ECBlockInputStreamProxy extends BlockExtendedInputStream {
       blockReader.close();
     }
     closed = true;
+    BlockExtendedInputStream reader;
+    synchronized (preadLock) {
+      reader = preadReader;
+      preadReader = null;
+    }
+    // Closed outside preadLock, as a positioned read may be inside the reader.
+    if (reader != null) {
+      reader.close();
+    }
   }
 
   private void ensureNotClosed() throws IOException {

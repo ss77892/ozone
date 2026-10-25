@@ -226,6 +226,9 @@ public final class ECStreamTestUtil {
     private List<ByteBuffer> blockStreamData;
     // List of EC indexes that should fail immediately on read
     private final List<Integer> failIndexes = new ArrayList<>();
+    // List of EC indexes whose next stream creation fails
+    private final List<Integer> failCreateIndexes = new ArrayList<>();
+    private int created;
     private CountDownLatch readBarrier;
 
     private Pipeline currentPipeline;
@@ -257,6 +260,16 @@ public final class ECStreamTestUtil {
       failIndexes.addAll(Arrays.asList(fail));
     }
 
+    // fail the next creation of a stream for each index in the list
+    public synchronized void setFailCreateIndexes(Integer... fail) {
+      failCreateIndexes.addAll(Arrays.asList(fail));
+    }
+
+    /** Returns the number of streams created, including those replaced since. */
+    public synchronized int getCreatedCount() {
+      return created;
+    }
+
     // every read of the streams created after this waits until the barrier has been reached by count reads
     public synchronized void setReadBarrier(CountDownLatch barrier) {
       this.readBarrier = barrier;
@@ -269,9 +282,13 @@ public final class ECStreamTestUtil {
         Token<OzoneBlockTokenIdentifier> token,
         XceiverClientFactory xceiverFactory,
         Function<BlockID, BlockLocationInfo> refreshFunction,
-        OzoneClientConfig config) {
+        OzoneClientConfig config) throws IOException {
 
       int repInd = currentPipeline.getReplicaIndex(pipeline.getNodes().get(0));
+      if (failCreateIndexes.remove(Integer.valueOf(repInd))) {
+        throw new IOException("create failed");
+      }
+      created++;
       TestBlockInputStream stream = new TestBlockInputStream(
           blockInfo.getBlockID(), blockInfo.getLength(),
           blockStreamData.get(repInd - 1).duplicate(), repInd);
@@ -299,6 +316,8 @@ public final class ECStreamTestUtil {
     private IOException errorToThrow = null;
     private int ecReplicaIndex = 0;
     private CountDownLatch readBarrier;
+    private volatile boolean closed = false;
+    private volatile int unbufferCalls = 0;
     private static final byte EOF = -1;
 
     TestBlockInputStream(BlockID blockId, long blockLen, ByteBuffer data) {
@@ -338,8 +357,31 @@ public final class ECStreamTestUtil {
       return ecReplicaIndex;
     }
 
+    public boolean isClosed() {
+      return closed;
+    }
+
+    public int getUnbufferCalls() {
+      return unbufferCalls;
+    }
+
     @Override
-    protected int readPositioned(long position, ByteBuffer buffer) {
+    protected int readPositioned(long position, ByteBuffer buffer) throws IOException {
+      if (shouldError) {
+        throwError();
+      }
+      // like BlockInputStream.initialize(), a slow positioned read holds the monitor that unbuffer() needs
+      synchronized (this) {
+        awaitReadBarrier();
+      }
+      // like read(ByteBuffer), a read that was in flight when the error was set fails too
+      if (shouldError) {
+        throwError();
+      }
+      // like BlockInputStream, a positioned read fails once the stream has been closed
+      if (closed) {
+        throw new IOException("Stream has been closed");
+      }
       if (position >= length) {
         return EOF;
       }
@@ -372,17 +414,7 @@ public final class ECStreamTestUtil {
       if (shouldError && data.position() >= shouldErrorPosition) {
         throwError();
       }
-      if (readBarrier != null) {
-        readBarrier.countDown();
-        try {
-          if (!readBarrier.await(10, TimeUnit.SECONDS)) {
-            throw new IOException("Timed out waiting for " + readBarrier.getCount() + " concurrent reads");
-          }
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          throw new IOException(e);
-        }
-      }
+      awaitReadBarrier();
       if (getRemaining() == 0) {
         return EOF;
       }
@@ -394,6 +426,20 @@ public final class ECStreamTestUtil {
         buf.put(data.get());
       }
       return toRead;
+    }
+
+    private void awaitReadBarrier() throws IOException {
+      if (readBarrier != null) {
+        readBarrier.countDown();
+        try {
+          if (!readBarrier.await(10, TimeUnit.SECONDS)) {
+            throw new IOException("Timed out waiting for " + readBarrier.getCount() + " concurrent reads");
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException(e);
+        }
+      }
     }
 
     private void throwError() throws IOException {
@@ -411,10 +457,13 @@ public final class ECStreamTestUtil {
     }
 
     @Override
-    public void close() { }
+    public void close() {
+      closed = true;
+    }
 
     @Override
-    public void unbuffer() {
+    public synchronized void unbuffer() {
+      unbufferCalls++;
     }
 
     @Override

@@ -25,6 +25,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedHashMap;
@@ -39,7 +40,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.hadoop.fs.FSExceptionMessages;
-import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ContainerBlockID;
 import org.apache.hadoop.hdds.client.ECReplicationConfig;
@@ -73,6 +73,13 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   private final BlockLocationInfo blockInfo;
   private final DatanodeDetails[] dataLocations;
   private final BlockExtendedInputStream[] blockStreams;
+  // Positioned reads use their own streams, locations, spares and failed locations, all guarded by the monitor of
+  // preadStreams, so they never touch the sequential state. Like read(), they switch a failed location to its spare;
+  // an index with no spare left fails the positioned read, which ECBlockInputStreamProxy serves by reconstruction.
+  private final DatanodeDetails[] preadLocations;
+  private final BlockExtendedInputStream[] preadStreams;
+  private final Map<Integer, LinkedList<DatanodeDetails>> preadSpareLocations = new TreeMap<>();
+  private final List<DatanodeDetails> preadFailedLocations = new ArrayList<>();
   private final Map<Integer, LinkedList<DatanodeDetails>> spareDataLocations
       = new TreeMap<>();
   private final List<DatanodeDetails> failedLocations = new ArrayList<>();
@@ -82,7 +89,7 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   private final Supplier<ExecutorService> parallelReadExecutor;
 
   private long position = 0;
-  private boolean closed = false;
+  private volatile boolean closed = false;
   private boolean seeked = false;
   private OzoneClientConfig config;
 
@@ -153,6 +160,9 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
 
     this.stripeSize = (long)ecChunkSize * repConfig.getData();
     setBlockLocations(this.blockInfo.getPipeline());
+    this.preadLocations = Arrays.copyOf(dataLocations, repConfig.getData());
+    this.preadStreams = new BlockExtendedInputStream[repConfig.getData()];
+    spareDataLocations.forEach((index, spares) -> preadSpareLocations.put(index, new LinkedList<>(spares)));
     string = getClass().getSimpleName() + "{" + blockIdForDebug() + "}@"
         + Integer.toHexString(hashCode());
     LOG.debug("{}: config: {}, locations: {} / {}", this,
@@ -192,38 +202,64 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   protected BlockExtendedInputStream getOrOpenStream(int locationIndex) throws IOException {
     BlockExtendedInputStream stream = blockStreams[locationIndex];
     if (stream == null) {
-      // To read an EC block, we create a STANDALONE pipeline that contains the
-      // single location for the block index we want to read. The EC blocks are
-      // indexed from 1 to N, however the data locations are stored in the
-      // dataLocations array indexed from zero.
-      DatanodeDetails dataLocation = dataLocations[locationIndex];
-      Pipeline pipeline = Pipeline.newBuilder()
-          .setReplicationConfig(StandaloneReplicationConfig.getInstance(
-              HddsProtos.ReplicationFactor.ONE))
-          .setNodes(Collections.singletonList(dataLocation))
-          .setId(dataLocation.getID())
-          .setReplicaIndexes(ImmutableMap.of(dataLocation, locationIndex + 1))
-          .setState(Pipeline.PipelineState.CLOSED)
-          .build();
-
-      BlockLocationInfo blkInfo = new BlockLocationInfo.Builder()
-          .setBlockID(blockInfo.getBlockID())
-          .setLength(internalBlockLength(locationIndex + 1, this.repConfig, this.blockInfo.getLength()))
-          .setPipeline(blockInfo.getPipeline())
-          .setToken(blockInfo.getToken())
-          .setPartNumber(blockInfo.getPartNumber())
-          .build();
-      stream = streamFactory.create(
-          StandaloneReplicationConfig.getInstance(
-              HddsProtos.ReplicationFactor.ONE),
-          blkInfo, pipeline,
-          blockInfo.getToken(), xceiverClientFactory,
-          ecPipelineRefreshFunction(locationIndex + 1, refreshFunction),
-          config);
+      stream = createStream(locationIndex, dataLocations[locationIndex]);
       blockStreams[locationIndex] = stream;
       LOG.debug("{}: created stream [{}]: {}", this, locationIndex, stream);
     }
     return stream;
+  }
+
+  /**
+   * Returns the pread stream of the index, opening it if needed, and records its location in readLocations: a failure
+   * of the stream is charged to that location, as another positioned read may switch the index to a spare meanwhile.
+   */
+  private BlockExtendedInputStream getOrOpenPreadStream(int locationIndex,
+      Map<Integer, DatanodeDetails> readLocations) throws IOException {
+    synchronized (preadStreams) {
+      checkOpen();
+      BlockExtendedInputStream stream = preadStreams[locationIndex];
+      if (stream == null) {
+        try {
+          stream = createStream(locationIndex, preadLocations[locationIndex]);
+        } catch (IOException e) {
+          throw new BadDataLocationException(preadLocations[locationIndex], locationIndex, e);
+        }
+        preadStreams[locationIndex] = stream;
+        LOG.debug("{}: created pread stream [{}]: {}", this, locationIndex, stream);
+      }
+      readLocations.put(locationIndex, preadLocations[locationIndex]);
+      return stream;
+    }
+  }
+
+  private BlockExtendedInputStream createStream(int locationIndex, DatanodeDetails dataLocation) throws IOException {
+    // To read an EC block, we create a STANDALONE pipeline that contains the
+    // single location for the block index we want to read. The EC blocks are
+    // indexed from 1 to N, however the data locations are stored in the
+    // dataLocations array indexed from zero.
+    Pipeline pipeline = Pipeline.newBuilder()
+        .setReplicationConfig(StandaloneReplicationConfig.getInstance(
+            HddsProtos.ReplicationFactor.ONE))
+        .setNodes(Collections.singletonList(dataLocation))
+        .setId(dataLocation.getID())
+        .setReplicaIndexes(ImmutableMap.of(dataLocation, locationIndex + 1))
+        .setState(Pipeline.PipelineState.CLOSED)
+        .build();
+
+    BlockLocationInfo blkInfo = new BlockLocationInfo.Builder()
+        .setBlockID(blockInfo.getBlockID())
+        .setLength(internalBlockLength(locationIndex + 1, this.repConfig, this.blockInfo.getLength()))
+        .setPipeline(blockInfo.getPipeline())
+        .setToken(blockInfo.getToken())
+        .setPartNumber(blockInfo.getPartNumber())
+        .build();
+    return streamFactory.create(
+        StandaloneReplicationConfig.getInstance(
+            HddsProtos.ReplicationFactor.ONE),
+        blkInfo, pipeline,
+        blockInfo.getToken(), xceiverClientFactory,
+        ecPipelineRefreshFunction(locationIndex + 1, refreshFunction),
+        config);
   }
 
   /**
@@ -327,15 +363,59 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
     return blockLength() - position;
   }
 
+  /**
+   * Positioned read from long-lived per-location streams, without touching the sequential cursor or streams. Like
+   * {@link #read(ByteBuffer)}, it retries a failed location from its spare; an index with no spare left is reported as
+   * {@link BadDataLocationException}, and {@link ECBlockInputStreamProxy} fails over to a reconstruction read.
+   */
   @Override
-  protected int readPositioned(long offset, ByteBuffer buffer) {
-    throw new UnsupportedOperationException("Use ECBlockInputStreamProxy for positioned reads");
+  protected int readPositioned(long offset, ByteBuffer buffer) throws IOException {
+    checkOpen();
+    if (offset >= blockLength()) {
+      return EOF;
+    }
+    while (true) {
+      int bufferPosition = buffer.position();
+      try {
+        return readCellsInParallel(offset, buffer, true);
+      } catch (BadDataLocationException e) {
+        if (!switchPreadLocationsToSpares(e)) {
+          throw e;
+        }
+        buffer.position(bufferPosition);
+      }
+    }
   }
 
-  @Override
-  public boolean hasCapability(String capability) {
-    return !StreamCapabilities.PREADBYTEBUFFER.equalsIgnoreCase(capability)
-        && super.hasCapability(capability);
+  /**
+   * Switches every failed pread location, unless already switched by another read, to its spare and closes its stream.
+   * Returns false if an index has no spare left; the exception then also names every location switched away from, so
+   * that a reconstruction read does not use them.
+   */
+  private boolean switchPreadLocationsToSpares(BadDataLocationException e) {
+    List<BlockExtendedInputStream> replaced = new ArrayList<>();
+    boolean retry = true;
+    synchronized (preadStreams) {
+      List<Integer> failedIndexes = e.getFailedLocationIndexes();
+      List<DatanodeDetails> failed = e.getFailedLocations();
+      for (int i = 0; i < failedIndexes.size(); i++) {
+        int failedIndex = failedIndexes.get(i);
+        if (!failed.get(i).equals(preadLocations[failedIndex])) {
+          continue;
+        }
+        if (!switchToSpare(preadLocations, preadSpareLocations, preadFailedLocations, failedIndex, "pread ")) {
+          retry = false;
+          continue;
+        }
+        replaced.add(preadStreams[failedIndex]);
+        preadStreams[failedIndex] = null;
+      }
+      if (!retry) {
+        e.addFailedLocations(preadFailedLocations);
+      }
+    }
+    closePreadStreams(replaced);
+    return retry;
   }
 
   @Override
@@ -349,7 +429,8 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
       int currentBufferPosition = byteBuffer.position();
       long currentPosition = getPos();
       try {
-        return spansMultipleCells(byteBuffer) ? readCellsInParallel(byteBuffer) : super.read(byteBuffer);
+        return spansMultipleCells(byteBuffer) ? readCellsInParallel(position, byteBuffer, false)
+            : super.read(byteBuffer);
       } catch (BadDataLocationException e) {
         boolean retry = true;
         for (int failedIndex : e.getFailedLocationIndexes()) {
@@ -376,15 +457,24 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   }
 
   protected boolean shouldRetryFailedRead(int failedIndex) {
-    Deque<DatanodeDetails> spareLocations = spareDataLocations.get(failedIndex);
-    if (spareLocations != null && !spareLocations.isEmpty()) {
-      failedLocations.add(dataLocations[failedIndex]);
-      DatanodeDetails spare = spareLocations.removeFirst();
-      dataLocations[failedIndex] = spare;
-      LOG.debug("{}: switching [{}] to spare {}", this, failedIndex, spare);
-      return true;
+    return switchToSpare(dataLocations, spareDataLocations, failedLocations, failedIndex, "");
+  }
+
+  /**
+   * Moves the location of an index to the next spare of the index, recording the old location as failed.
+   * @param readKind prefix for the debug log, telling which read path's locations are switched.
+   * @return false if the index has no spare left, so the location is kept.
+   */
+  private boolean switchToSpare(DatanodeDetails[] locations, Map<Integer, LinkedList<DatanodeDetails>> spares,
+      List<DatanodeDetails> failed, int index, String readKind) {
+    Deque<DatanodeDetails> spareLocations = spares.get(index);
+    if (spareLocations == null || spareLocations.isEmpty()) {
+      return false;
     }
-    return false;
+    failed.add(locations[index]);
+    locations[index] = spareLocations.removeFirst();
+    LOG.debug("{}: switching {}[{}] to spare {}", this, readKind, index, locations[index]);
+    return true;
   }
 
   /**
@@ -441,10 +531,12 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
    * <p>Like {@link #readWithStrategy}, the position and the buffer are advanced past the data that was read. If a
    * read fails, they are advanced only by the cells before the first failed cell, and a
    * {@link BadDataLocationException} carrying every failed index is thrown.
+   *
+   * <p>A positioned read ({@code pread}) uses the pread streams and does not change the position. Without a
+   * parallel read executor, the calling thread reads every cell.
    */
-  private int readCellsInParallel(ByteBuffer buffer) throws IOException {
-    final long startPosition = position;
-    final int length = (int) Math.min(buffer.remaining(), remaining());
+  private int readCellsInParallel(long startPosition, ByteBuffer buffer, boolean pread) throws IOException {
+    final int length = (int) Math.min(buffer.remaining(), blockLength() - startPosition);
     final int bufferStart = buffer.position();
 
     // Split the range into cells, grouped by data index in the order they are first needed.
@@ -463,21 +555,27 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
 
     // getOrOpenStream is not thread safe, so open every stream before reading.
     final List<FutureTask<IndexReadResult>> tasks = new ArrayList<>();
+    // the location each pread stream was handed out for, which a failure of the stream is charged to
+    final Map<Integer, DatanodeDetails> preadReadLocations = new TreeMap<>();
     for (Map.Entry<Integer, List<CellRead>> entry : cellsByIndex.entrySet()) {
       int index = entry.getKey();
       BlockExtendedInputStream stream;
-      try {
-        stream = getOrOpenStream(index);
-      } catch (IOException e) {
-        throw new BadDataLocationException(dataLocations[index], index, e);
+      if (pread) {
+        stream = getOrOpenPreadStream(index, preadReadLocations);
+      } else {
+        try {
+          stream = getOrOpenStream(index);
+        } catch (IOException e) {
+          throw new BadDataLocationException(dataLocations[index], index, e);
+        }
       }
       List<CellRead> indexCells = entry.getValue();
-      boolean checkPosition = seeked;
-      tasks.add(new FutureTask<>(() -> readCells(stream, indexCells, buffer, bufferStart, checkPosition)));
+      boolean checkPosition = !pread && seeked;
+      tasks.add(new FutureTask<>(() -> readCells(stream, indexCells, buffer, bufferStart, checkPosition, pread)));
     }
 
-    ExecutorService executor = parallelReadExecutor.get();
-    for (int i = 1; i < tasks.size(); i++) {
+    ExecutorService executor = parallelReadExecutor != null ? parallelReadExecutor.get() : null;
+    for (int i = 1; executor != null && i < tasks.size(); i++) {
       try {
         executor.execute(tasks.get(i));
       } catch (RejectedExecutionException e) {
@@ -502,7 +600,7 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
     }
     // After a failure, the streams of indexes read past the cells that position advances by below, so a later read
     // must check the position of every stream, as after a seek.
-    if (unexpected != null || results.values().stream().anyMatch(result -> result.error != null)) {
+    if (!pread && (unexpected != null || results.values().stream().anyMatch(result -> result.error != null))) {
       seeked = true;
     }
     if (unexpected != null) {
@@ -519,7 +617,9 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
       }
       read += cell.length;
     }
-    position = startPosition + read;
+    if (!pread) {
+      position = startPosition + read;
+    }
     buffer.position(bufferStart + read);
     LOG.trace("{}: read {} bytes from {} indexes in parallel", this, read, tasks.size());
 
@@ -527,7 +627,7 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
     IOException cause = null;
     for (IndexReadResult result : results.values()) {
       if (result.error != null) {
-        failures.put(result.index, dataLocations[result.index]);
+        failures.put(result.index, pread ? preadReadLocations.get(result.index) : dataLocations[result.index]);
         if (cause == null) {
           cause = result.error;
         } else {
@@ -536,6 +636,10 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
       }
     }
     if (cause != null) {
+      // A pread stream that close() closed under the read failed because of the close, not because of its location.
+      if (pread) {
+        checkOpen();
+      }
       throw new BadDataLocationException(failures, cause);
     }
     return read;
@@ -546,7 +650,7 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
    * stream monitor, so it only uses the given stream and state that does not change while the caller waits.
    */
   private IndexReadResult readCells(BlockExtendedInputStream stream, List<CellRead> indexCells, ByteBuffer buffer,
-      int bufferStart, boolean checkPosition) {
+      int bufferStart, boolean checkPosition, boolean pread) {
     int index = indexCells.get(0).index;
     int cellsRead = 0;
     try {
@@ -560,7 +664,7 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
         ByteBuffer slice = buffer.duplicate();
         slice.position(bufferStart + cell.bufferOffset);
         slice.limit(bufferStart + cell.bufferOffset + cell.length);
-        int actualRead = stream.read(slice);
+        int actualRead = pread ? stream.read(streamPosition, slice) : stream.read(slice);
         if (actualRead == EOF) {
           throw new IOException("Expected to read " + cell.length + " but got EOF"
               + " from blockGroup " + stream.getBlockID() + " index " + (index + 1));
@@ -690,7 +794,26 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   public synchronized void close() {
     LOG.debug("{}: close", this);
     closeStreams();
-    closed = true;
+    BlockExtendedInputStream[] streams;
+    synchronized (preadStreams) {
+      closed = true;
+      streams = preadStreams.clone();
+      Arrays.fill(preadStreams, null);
+    }
+    closePreadStreams(Arrays.asList(streams));
+  }
+
+  /** Closes the given pread streams; called outside the pread streams monitor, which must not wait on a read. */
+  private void closePreadStreams(List<BlockExtendedInputStream> streams) {
+    for (BlockExtendedInputStream stream : streams) {
+      if (stream != null) {
+        try {
+          stream.close();
+        } catch (IOException e) {
+          LOG.error("{}: failed to close pread stream {}", this, stream, e);
+        }
+      }
+    }
   }
 
   protected synchronized void closeStreams() {
@@ -717,9 +840,21 @@ public class ECBlockInputStream extends BlockExtendedInputStream {
   }
 
   @Override
-  public synchronized void unbuffer() {
+  public void unbuffer() {
     LOG.trace("{}: unbuffer", this);
-    for (BlockExtendedInputStream stream : blockStreams) {
+    synchronized (this) {
+      for (BlockExtendedInputStream stream : blockStreams) {
+        if (stream != null) {
+          stream.unbuffer();
+        }
+      }
+    }
+    BlockExtendedInputStream[] streams;
+    synchronized (preadStreams) {
+      streams = preadStreams.clone();
+    }
+    // Unbuffered outside both monitors, as a pread stream may be inside a slow positioned read.
+    for (BlockExtendedInputStream stream : streams) {
       if (stream != null) {
         stream.unbuffer();
       }
