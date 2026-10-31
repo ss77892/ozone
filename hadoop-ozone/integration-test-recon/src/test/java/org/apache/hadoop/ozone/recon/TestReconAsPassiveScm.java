@@ -135,9 +135,10 @@ public class TestReconAsPassiveScm {
     XceiverClientGrpc client = new XceiverClientGrpc(pipeline, conf);
     runTestOzoneContainerViaDataNode(containerID, client);
 
-    // Verify Recon picked up the new container that was created.
-    assertEquals(scmContainerManager.getContainers(),
-        reconContainerManager.getContainers());
+    // Verify Recon picked up the new container that was created. Recon learns about it
+    // asynchronously from the datanode container report, so wait for it.
+    LambdaTestUtils.await(60000, 1000,
+        () -> scmContainerManager.getContainers().equals(reconContainerManager.getContainers()));
 
     LogCapturer logCapturer = LogCapturer.captureLogs(ReconNodeManager.class);
     GenericTestUtils.setLogLevel(ReconNodeManager.class, Level.DEBUG);
