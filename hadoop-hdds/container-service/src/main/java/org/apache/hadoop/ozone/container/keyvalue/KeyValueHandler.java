@@ -2354,7 +2354,7 @@ public class KeyValueHandler extends Handler {
               + blockData.getSize()));
     }
     final BlockReadCursor cursor = new BlockReadCursor(readBlock.getOffset(), readBlock.getLength(),
-        responseDataSize, blockData.getChunks());
+        responseDataSize, blockData.getChunks(), readBlock.getIncludeChecksums() || validateChunkChecksumData);
     final ByteBuffer buffer = ByteBuffer.allocate(cursor.responseDataSize());
     long bytesRead = 0;
     while (cursor.hasNext()) {
