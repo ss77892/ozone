@@ -212,6 +212,6 @@ Verify Container Balancer for RATIS/EC containers
     ${datanodeOzoneUsedBytesInfoAfterContainerBalancing} =    Get Datanode Ozone Used Bytes Info          ${uuid}
     Should Not Be Equal As Integers     ${datanodeOzoneUsedBytesInfo}    ${datanodeOzoneUsedBytesInfoAfterContainerBalancing}
     #We need to ensure that after balancing, the amount of data recorded on each datanode falls within the following ranges:
-    #{SIZE}*3 < used < {SIZE}*3.5 for RATIS containers, and {SIZE}*0.7 < used < {SIZE}*1.5 for EC containers.
+    #{SIZE}*1.9 < used < {SIZE}*3.5 for RATIS containers, and {SIZE}*0.7 < used < {SIZE}*1.5 for EC containers.
     Should Be True    ${datanodeOzoneUsedBytesInfoAfterContainerBalancing} < ${SIZE} * ${UPPER_LIMIT}
     Should Be True    ${datanodeOzoneUsedBytesInfoAfterContainerBalancing} > ${SIZE} * ${LOWER_LIMIT}
