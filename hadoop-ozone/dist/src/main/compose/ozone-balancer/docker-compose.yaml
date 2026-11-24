@@ -27,6 +27,15 @@ x-replication:
   &replication
    OZONE-SITE.XML_ozone.server.default.replication: ${OZONE_REPLICATION_FACTOR:-3}
 
+x-scm-debug-log:
+  &scm-debug-log
+   LOG4J.PROPERTIES_log4j.rootLogger: INFO, console
+   LOG4J.PROPERTIES_log4j.appender.console: org.apache.log4j.ConsoleAppender
+   LOG4J.PROPERTIES_log4j.appender.console.target: System.err
+   LOG4J.PROPERTIES_log4j.appender.console.layout: org.apache.log4j.PatternLayout
+   LOG4J.PROPERTIES_log4j.appender.console.layout.ConversionPattern: "%d{ISO8601} [%t] %p %c{2}: %m%n"
+   LOG4J.PROPERTIES_log4j.logger.org.apache.hadoop.hdds.scm.container.balancer: DEBUG
+
 services:
    datanode1:
       <<: *common-config
@@ -146,7 +155,7 @@ services:
       environment:
          ENSURE_SCM_INITIALIZED: /data/metadata/scm/current/VERSION
          OZONE-SITE.XML_hdds.scm.safemode.min.datanode: ${OZONE_SAFEMODE_MIN_DATANODES:-1}
-         <<: *replication
+         <<: [*replication, *scm-debug-log]
       command: ["ozone","scm"]
    scm2:
       <<: *common-config
@@ -156,7 +165,7 @@ services:
          WAITFOR: scm1:9894
          ENSURE_SCM_BOOTSTRAPPED: /data/metadata/scm/current/VERSION
          OZONE-SITE.XML_hdds.scm.safemode.min.datanode: ${OZONE_SAFEMODE_MIN_DATANODES:-1}
-         <<: *replication
+         <<: [*replication, *scm-debug-log]
       command: ["ozone","scm"]
    scm3:
       <<: *common-config
@@ -166,7 +175,7 @@ services:
          WAITFOR: scm2:9894
          ENSURE_SCM_BOOTSTRAPPED: /data/metadata/scm/current/VERSION
          OZONE-SITE.XML_hdds.scm.safemode.min.datanode: ${OZONE_SAFEMODE_MIN_DATANODES:-1}
-         <<: *replication
+         <<: [*replication, *scm-debug-log]
       command: ["ozone","scm"]
    httpfs:
       <<: *common-config
